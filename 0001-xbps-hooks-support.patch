@@ -362,10 +362,18 @@ index 2b4efe4..41f85fa 100644
  OBJS += transaction_check_revdeps.o transaction_check_conflicts.o
  OBJS += transaction_check_shlibs.o
 diff --git a/lib/transaction_commit.c b/lib/transaction_commit.c
-index 122b9f8..0e47d34 100644
+index 122b9f8..941d185 100644
 --- a/lib/transaction_commit.c
 +++ b/lib/transaction_commit.c
-@@ -208,6 +208,16 @@ xbps_transaction_commit(struct xbps_handle *xhp)
+@@ -108,6 +108,7 @@ xbps_transaction_commit(struct xbps_handle *xhp)
+ 	xbps_trans_type_t ttype;
+ 	const char *pkgver = NULL, *pkgname = NULL;
+ 	int rv = 0;
++	bool pkgdb_unlocked = false;
+ 
+ 	setlocale(LC_ALL, "");
+ 
+@@ -208,6 +209,16 @@ xbps_transaction_commit(struct xbps_handle *xhp)
  		goto out;
  	}
  
@@ -382,7 +390,30 @@ index 122b9f8..0e47d34 100644
  	/*
  	 * Run all pre-remove scripts.
  	 * And store the remove scripts in remove_scripts
-@@ -439,6 +449,31 @@ xbps_transaction_commit(struct xbps_handle *xhp)
+@@ -394,6 +405,22 @@ xbps_transaction_commit(struct xbps_handle *xhp)
+ 	if ((rv = xbps_pkgdb_update(xhp, true, true)) != 0)
+ 		goto out;
+ 
++	/*
++	 * pkgdb is now flushed to disk. Release the lock here, before
++	 * running any package INSTALL/REMOVE scripts or post-transaction
++	 * hooks: both can legitimately want to shell out to
++	 * xbps-install/xbps-remove themselves (e.g. a hook that clears
++	 * the package cache, or a package script that installs another
++	 * package it needs at runtime), and without releasing the lock
++	 * first, that nested call would deadlock forever waiting on the
++	 * lock this same process is still holding.
++	 *
++	 * The lock is re-acquired further down, right before the final
++	 * pkgdb_update() call, so that write stays protected too.
++	 */
++	xbps_pkgdb_unlock(xhp);
++	pkgdb_unlocked = true;
++
+ 	/*
+ 	 * Run all post and purge-remove scripts.
+ 	 */
+@@ -439,10 +466,42 @@ xbps_transaction_commit(struct xbps_handle *xhp)
  		}
  	}
  
@@ -392,28 +423,39 @@ index 122b9f8..0e47d34 100644
 +	 * install/update/remove already completed successfully by this
 +	 * point, and there is nothing left to roll back.
 +	 *
-+	 * The pkgdb lock is released first: by this point pkgdb has
-+	 * already been flushed to disk (see xbps_pkgdb_update() above)
-+	 * and nothing in this process touches it again before exit, so
-+	 * it's safe to let go of it here. Without this, a hook that
-+	 * itself shells out to xbps-install/xbps-remove (a very common
-+	 * and legitimate thing to want in a post hook, e.g. clearing the
-+	 * package cache) would deadlock forever waiting on the lock this
-+	 * same process is still holding. xbps_pkgdb_release() at process
-+	 * exit calls xbps_pkgdb_unlock() again, which is a harmless
-+	 * no-op once already unlocked.
++	 * The pkgdb lock was already released above (see the comment
++	 * next to xbps_pkgdb_unlock() near the first xbps_pkgdb_update()
++	 * call), specifically so hooks are free to shell out to
++	 * xbps-install/xbps-remove without deadlocking.
 +	 *
 +	 * Pre-transaction hooks deliberately do NOT get this treatment:
 +	 * at that point nothing has been written yet, so releasing the
 +	 * lock there would let a hook-spawned transaction race with (and
 +	 * potentially corrupt) the one that's about to run.
 +	 */
-+	xbps_pkgdb_unlock(xhp);
 +	(void)xbps_transaction_hooks(xhp, "post");
 +
  out:
  	xbps_object_release(remove_scripts);
  	xbps_object_iterator_release(iter);
+ 	if (rv == 0) {
++		/*
++		 * Re-acquire the lock released above before this final
++		 * write: pkgdb was safe to read/write-free while post
++		 * and pre-purge scripts and post-transaction hooks ran,
++		 * but this last update needs the same protection the
++		 * first one had. Only do this if we actually unlocked
++		 * earlier in this call -- xbps_pkgdb_lock() is not
++		 * reentrant, and calling it again while this process
++		 * still holds the original lock (every early `goto out`
++		 * above the unlock point) would deadlock the process
++		 * against itself.
++		 */
++		if (pkgdb_unlocked && xbps_pkgdb_lock(xhp) < 0)
++			return errno;
+ 		/* Force a pkgdb write for all unpacked pkgs in transaction */
+ 		rv = xbps_pkgdb_update(xhp, true, true);
+ 	}
 diff --git a/lib/transaction_hooks.c b/lib/transaction_hooks.c
 new file mode 100644
 index 0000000..818d3fc
