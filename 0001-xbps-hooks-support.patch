@@ -1,3 +1,153 @@
+diff --git a/bin/xbps-install/Makefile b/bin/xbps-install/Makefile
+index 3526445..201be21 100644
+--- a/bin/xbps-install/Makefile
++++ b/bin/xbps-install/Makefile
+@@ -3,5 +3,21 @@ TOPDIR = ../..
+ 
+ BIN = xbps-install
+ OBJS = main.o transaction.o question.o fetch_cb.o state_cb.o util.o
++OBJS += ../xbps-remove/clean-cache.o
+ 
+ include $(TOPDIR)/mk/prog.mk
++
++# The generic %.o: %.c rule above (from mk/prog.mk) compiles with `-c`
++# and no explicit `-o`, which only produces the right path when the
++# object already exists (built by an earlier, alphabetically-preceding
++# subdirectory) and make skips recompiling it. xbps-remove's own
++# cross-references to ../xbps-install/*.o rely on exactly that
++# ordering accident. Since xbps-install builds *before* xbps-remove
++# alphabetically, the same trick doesn't work in this direction: an
++# explicit rule with a correct -o $@ is needed so the object lands in
++# ../xbps-remove/ instead of here. This must come *after* the
++# mk/prog.mk include, otherwise it becomes the file's first rule and
++# hijacks the default "make" goal away from "all".
++../xbps-remove/clean-cache.o: ../xbps-remove/clean-cache.c
++	@printf " [CC]\t\t$@\n"
++	${SILENT}$(CC) $(CPPFLAGS) $(PROG_CFLAGS) $(CFLAGS) $(EXTRA_CFLAGS) -c $< -o $@
+diff --git a/bin/xbps-install/main.c b/bin/xbps-install/main.c
+index 8f8be81..11aeb05 100644
+--- a/bin/xbps-install/main.c
++++ b/bin/xbps-install/main.c
+@@ -36,6 +36,7 @@
+ 
+ #include <xbps.h>
+ #include "defs.h"
++#include "../xbps-remove/defs.h"
+ 
+ static void __attribute__((noreturn))
+ usage(bool fail)
+@@ -57,6 +58,10 @@ usage(bool fail)
+ 	    " -M, --memory-sync           Remote repository data is fetched and stored\n"
+ 	    "                             in memory, ignoring on-disk repodata archives\n"
+ 	    " -n, --dry-run               Dry-run mode\n"
++	    " -O, --clean-cache           Remove outdated packages from the cache\n"
++	    "                             If specified twice, also remove uninstalled packages\n"
++	    "                             If specified three times, remove everything from the cache\n"
++	    " -o, --remove-orphans        Remove package orphans\n"
+ 	    " -R, --repository <url>      Add repository to the top of the list\n"
+ 	    "                             This option can be specified multiple times\n"
+ 	    " -r, --rootdir <dir>         Full path to rootdir\n"
+@@ -97,7 +102,7 @@ repo_import_key_cb(struct xbps_repo *repo, void *arg UNUSED, bool *done UNUSED)
+ int
+ main(int argc, char **argv)
+ {
+-	const char *shortopts = "AC:c:DdfhIiMnR:r:SuUVvy";
++	const char *shortopts = "AC:c:DdfhIiMnoOR:r:SuUVvy";
+ 	const struct option longopts[] = {
+ 		{ "automatic", no_argument, NULL, 'A' },
+ 		{ "config", required_argument, NULL, 'C' },
+@@ -110,6 +115,8 @@ main(int argc, char **argv)
+ 		{ "ignore-file-conflicts", no_argument, NULL, 'I' },
+ 		{ "memory-sync", no_argument, NULL, 'M' },
+ 		{ "dry-run", no_argument, NULL, 'n' },
++		{ "clean-cache", no_argument, NULL, 'O' },
++		{ "remove-orphans", no_argument, NULL, 'o' },
+ 		{ "repository", required_argument, NULL, 'R' },
+ 		{ "rootdir", required_argument, NULL, 'r' },
+ 		{ "sync", no_argument, NULL, 'S' },
+@@ -125,13 +132,13 @@ main(int argc, char **argv)
+ 	struct xbps_handle xh;
+ 	struct xferstat xfer;
+ 	const char *rootdir, *cachedir, *confdir;
+-	int i, c, flags, rv, fflag = 0;
+-	bool syncf, yes, force, drun, update;
++	int i, c, flags, rv, fflag = 0, clean_cache = 0;
++	bool syncf, yes, force, drun, update, orphans;
+ 	int maxcols, eexist = 0;
+ 
+ 	rootdir = cachedir = confdir = NULL;
+ 	flags = rv = 0;
+-	syncf = yes = force = drun = update = false;
++	syncf = yes = force = drun = update = orphans = false;
+ 
+ 	memset(&xh, 0, sizeof(xh));
+ 
+@@ -179,6 +186,12 @@ main(int argc, char **argv)
+ 		case 'n':
+ 			drun = true;
+ 			break;
++		case 'O':
++			clean_cache++;
++			break;
++		case 'o':
++			orphans = true;
++			break;
+ 		case 'R':
+ 			xbps_repo_store(&xh, optarg);
+ 			break;
+@@ -209,7 +222,7 @@ main(int argc, char **argv)
+ 			/* NOTREACHED */
+ 		}
+ 	}
+-	if ((!update && !syncf) && (argc == optind))
++	if ((!update && !syncf && !clean_cache && !orphans) && (argc == optind))
+ 		usage(true);
+ 
+ 	/*
+@@ -249,7 +262,7 @@ main(int argc, char **argv)
+ 		}
+ 	}
+ 
+-	if (syncf && !update && (argc == optind))
++	if (syncf && !update && !clean_cache && !orphans && (argc == optind))
+ 		exit(EXIT_SUCCESS);
+ 
+ 	if (!(xh.flags & XBPS_FLAG_DOWNLOAD_ONLY) && !drun) {
+@@ -259,6 +272,34 @@ main(int argc, char **argv)
+ 		}
+ 	}
+ 
++	if (clean_cache > 0) {
++		rv = clean_cachedir(&xh, clean_cache, drun);
++		if (rv != 0) {
++			xbps_end(&xh);
++			exit(EXIT_FAILURE);
++		}
++		if (!orphans && !update && (argc == optind))
++			exit(EXIT_SUCCESS);
++	}
++
++	if (orphans) {
++		if ((rv = xbps_transaction_autoremove_pkgs(&xh)) != 0 && rv != ENOENT) {
++			xbps_error_printf("Failed to queue package "
++			    "orphans: %s\n", strerror(rv));
++			xbps_end(&xh);
++			exit(EXIT_FAILURE);
++		}
++		if (rv == 0) {
++			rv = exec_transaction(&xh, maxcols, yes, drun);
++		} else {
++			rv = 0; /* ENOENT: no orphans found, nothing to do */
++		}
++		if (!update && (argc == optind)) {
++			xbps_end(&xh);
++			exit(rv);
++		}
++	}
++
+ 	eexist = optind;
+ 
+ 	if (update && (argc == optind)) {
 diff --git a/bin/xbps-install/state_cb.c b/bin/xbps-install/state_cb.c
 index 350c608..63fc574 100644
 --- a/bin/xbps-install/state_cb.c
@@ -23,11 +173,116 @@ index 350c608..63fc574 100644
  	case XBPS_STATE_UNPACK_FAIL:
  	case XBPS_STATE_UPDATE_FAIL:
  	case XBPS_STATE_CONFIGURE_FAIL:
+diff --git a/bin/xbps-remove/clean-cache.c b/bin/xbps-remove/clean-cache.c
+index 38816b1..a06760a 100644
+--- a/bin/xbps-remove/clean-cache.c
++++ b/bin/xbps-remove/clean-cache.c
+@@ -66,7 +66,7 @@ binpkg_parse(char *buf, size_t bufsz, const char *path, const char **pkgver, con
+ 
+ struct cleaner_data {
+ 	bool dry;
+-	bool uninstalled;
++	int level;
+ };
+ 
+ static int
+@@ -94,11 +94,20 @@ cleaner_cb(struct xbps_handle *xhp, xbps_object_t obj,
+ 		return 0;
+ 	}
+ 
++	/*
++	 * Level 3+ ("-O -O -O"): unconditional full wipe, matching
++	 * pacman's `-Scc` -- don't even look the package up, just
++	 * remove it, regardless of whether it's the currently
++	 * installed version or matches a repository entry.
++	 */
++	if (data->level >= 3)
++		goto remove;
++
+ 	/*
+ 	 * Remove binary pkg if it's not registered in any repository
+ 	 * or if hash doesn't match.
+ 	 */
+-	if (data->uninstalled) {
++	if (data->level >= 2) {
+ 		pkgd = xbps_pkgdb_get_pkg(xhp, binpkgver);
+ 	} else {
+ 		pkgd = xbps_rpool_get_pkg(xhp, binpkgver);
+@@ -118,13 +127,15 @@ cleaner_cb(struct xbps_handle *xhp, xbps_object_t obj,
+ 			return 0;
+ 		}
+ 	}
++remove:
+ 	snprintf(buf, sizeof(buf), "%s.sig", binpkg);
+ 	snprintf(buf2, sizeof(buf2), "%s.sig2", binpkg);
+ 	if (!data->dry && unlink(binpkg) == -1) {
+ 		xbps_error_printf("Failed to remove `%s': %s\n",
+ 		    binpkg, strerror(errno));
+ 	} else {
+-		printf("Removed %s from cachedir (obsolete)\n", binpkg);
++		printf("Removed %s from cachedir%s\n", binpkg,
++		    data->level >= 3 ? "" : " (obsolete)");
+ 	}
+ 	if (!data->dry && unlink(buf) == -1 && errno != ENOENT) {
+ 		xbps_error_printf("Failed to remove `%s': %s\n",
+@@ -139,7 +150,7 @@ cleaner_cb(struct xbps_handle *xhp, xbps_object_t obj,
+ }
+ 
+ int
+-clean_cachedir(struct xbps_handle *xhp, bool uninstalled, bool drun)
++clean_cachedir(struct xbps_handle *xhp, int level, bool drun)
+ {
+ 	xbps_array_t array = NULL;
+ 	DIR *dirp;
+@@ -151,9 +162,12 @@ clean_cachedir(struct xbps_handle *xhp, bool uninstalled, bool drun)
+ 	// its done potentially concurrently by threads through the
+ 	// xbps_array_foreach_cb_multi call later.
+ 	// XXX: same for the repository pool...
+-	if (uninstalled) {
++	//
++	// Level 3+ is an unconditional wipe: it never looks anything up
++	// in pkgdb or the repo pool, so there's nothing to preload.
++	if (level == 2) {
+ 		(void)xbps_pkgdb_get_pkg(xhp, "package-that-wont-exist");
+-	} else {
++	} else if (level == 1) {
+ 		(void)xbps_rpool_get_pkg(xhp, "package-that-wont-exist-so-it-loads-all-repos");
+ 		(void)xbps_pkgdb_get_pkg(xhp, "package-that-wont-exist");
+ 	}
+@@ -204,7 +218,7 @@ clean_cachedir(struct xbps_handle *xhp, bool uninstalled, bool drun)
+ 	if (xbps_array_count(array)) {
+ 		struct cleaner_data data = {
+ 			.dry = drun,
+-			.uninstalled = uninstalled,
++			.level = level,
+ 		};
+ 		r = xbps_array_foreach_cb_multi(xhp, array, NULL, cleaner_cb, (void*)&data);
+ 	} else {
+diff --git a/bin/xbps-remove/defs.h b/bin/xbps-remove/defs.h
+index 5b39ba8..106c55e 100644
+--- a/bin/xbps-remove/defs.h
++++ b/bin/xbps-remove/defs.h
+@@ -27,6 +27,6 @@
+ #define _XBPS_REMOVE_DEFS_H_
+ 
+ /* From clean-cache.c */
+-int	clean_cachedir(struct xbps_handle *, bool uninstalled, bool drun);
++int	clean_cachedir(struct xbps_handle *, int level, bool drun);
+ 
+ #endif /* !_XBPS_REMOVE_DEFS_H_ */
 diff --git a/bin/xbps-remove/main.c b/bin/xbps-remove/main.c
-index 1ab4ffc..ba4d13f 100644
+index 1ab4ffc..42d2f54 100644
 --- a/bin/xbps-remove/main.c
 +++ b/bin/xbps-remove/main.c
-@@ -78,6 +78,12 @@ state_cb_rm(const struct xbps_state_cb_data *xscd, void *cbdata UNUSED)
+@@ -54,6 +54,7 @@ usage(bool fail)
+ 	    " -n, --dry-run             Dry-run mode\n"
+ 	    " -O, --clean-cache         Remove outdated packages from the cache\n"
+ 	    "                           If specified twice, also remove uninstalled packages\n"
++	    "                           If specified three times, remove everything from the cache\n"
+ 	    " -o, --remove-orphans      Remove package orphans\n"
+ 	    " -R, --recursive           Recursively remove dependencies\n"
+ 	    " -r, --rootdir <dir>       Full path to rootdir\n"
+@@ -78,6 +79,12 @@ state_cb_rm(const struct xbps_state_cb_data *xscd, void *cbdata UNUSED)
  	case XBPS_STATE_REMOVE:
  		printf("Removing `%s' ...\n", xscd->arg);
  		break;
@@ -40,7 +295,7 @@ index 1ab4ffc..ba4d13f 100644
  	/* success */
  	case XBPS_STATE_REMOVE_FILE:
  	case XBPS_STATE_REMOVE_FILE_OBSOLETE:
-@@ -94,6 +100,7 @@ state_cb_rm(const struct xbps_state_cb_data *xscd, void *cbdata UNUSED)
+@@ -94,6 +101,7 @@ state_cb_rm(const struct xbps_state_cb_data *xscd, void *cbdata UNUSED)
  		break;
  	/* errors */
  	case XBPS_STATE_REMOVE_FAIL:
@@ -48,6 +303,15 @@ index 1ab4ffc..ba4d13f 100644
  		xbps_error_printf("%s\n", xscd->desc);
  		if (slog) {
  			syslog(LOG_ERR, "%s", xscd->desc);
+@@ -266,7 +274,7 @@ main(int argc, char **argv)
+ 	maxcols = get_maxcols();
+ 
+ 	if (clean_cache > 0) {
+-		rv = clean_cachedir(&xh, clean_cache > 1, drun);
++		rv = clean_cachedir(&xh, clean_cache, drun);
+ 		if (rv) {
+ 			xbps_end(&xh);
+ 			exit(EXIT_FAILURE);
 diff --git a/include/xbps.h.in b/include/xbps.h.in
 index 6a35eeb..f285c7b 100644
 --- a/include/xbps.h.in

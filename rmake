@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+
+#1. Clonar o repositório limpo
+git clone https://github.com/void-linux/xbps .
+#cd xbps
+
+# Se essa pasta já tiver algum patch antigo aplicado, limpe antes:
+git checkout -- .
+git clean -fd
+
+# Copie o arquivo 0001-xbps-hooks-support.patch pra dentro dessa pasta xbps/.
+cp ../0001-xbps-hooks-support.patch .
+
+# 2. Validar e aplicar o patch
+# Validar que aplica limpo (não muda nada ainda)
+if ! git apply --check 0001-xbps-hooks-support.patch; then
+  echo "ERRO, falha ao aplicar o patch" exit 1
+fi
+echo "OK, aplica limpo"
+
+# Aplicar de verdade
+if ! git apply 0001-xbps-hooks-support.patch; then
+  echo "ERRO, falha ao aplicar o patch" exit 1
+fi
+
+# 3. Instalar dependências de build
+sudo xbps-install -Sy libarchive-devel openssl-devel zlib-devel
+
+# 4. Configurar e compilar
+./configure --enable-rpath --prefix=/usr --sysconfdir=/etc
+make -j$(nproc)
+
+# 5. Instalar num diretório separado (sem tocar no sistema)
+make DESTDIR=~/xbps-hook install clean
+export PATH=~/xbps-hook/usr/bin:$PATH
+export LD_LIBRARY_PATH=~/xbps-hook/usr/lib
+
+#Confirmar que é o binário certo:
+xbps-install --version
+xbps-install
+
+# 6. Testar
+#sudo env PATH="$PATH" LD_LIBRARY_PATH="$LD_LIBRARY_PATH" xbps-install -f yasm
