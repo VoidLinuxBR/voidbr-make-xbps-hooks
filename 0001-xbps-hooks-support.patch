@@ -1,0 +1,783 @@
+diff --git a/bin/xbps-install/state_cb.c b/bin/xbps-install/state_cb.c
+index 350c608..78de04a 100644
+--- a/bin/xbps-install/state_cb.c
++++ b/bin/xbps-install/state_cb.c
+@@ -62,6 +62,9 @@ state_cb(const struct xbps_state_cb_data *xscd, void *cbdata UNUSED)
+ 	case XBPS_STATE_TRANS_CONFIGURE:
+ 		printf("\n[*] Configuring unpacked packages\n");
+ 		break;
++	case XBPS_STATE_TRANS_HOOKS:
++		printf("[*] Running hook: %s\n", xscd->desc);
++		break;
+ 	case XBPS_STATE_PKGDB:
+ 		printf("[*] pkgdb upgrade in progress, please wait...\n");
+ 		break;
+@@ -161,6 +164,7 @@ state_cb(const struct xbps_state_cb_data *xscd, void *cbdata UNUSED)
+ 		break;
+ 	/* errors */
+ 	case XBPS_STATE_TRANS_FAIL:
++	case XBPS_STATE_TRANS_HOOKS_FAIL:
+ 	case XBPS_STATE_UNPACK_FAIL:
+ 	case XBPS_STATE_UPDATE_FAIL:
+ 	case XBPS_STATE_CONFIGURE_FAIL:
+diff --git a/bin/xbps-remove/main.c b/bin/xbps-remove/main.c
+index 1ab4ffc..5b10991 100644
+--- a/bin/xbps-remove/main.c
++++ b/bin/xbps-remove/main.c
+@@ -78,6 +78,9 @@ state_cb_rm(const struct xbps_state_cb_data *xscd, void *cbdata UNUSED)
+ 	case XBPS_STATE_REMOVE:
+ 		printf("Removing `%s' ...\n", xscd->arg);
+ 		break;
++	case XBPS_STATE_TRANS_HOOKS:
++		printf("[*] Running hook: %s\n", xscd->desc);
++		break;
+ 	/* success */
+ 	case XBPS_STATE_REMOVE_FILE:
+ 	case XBPS_STATE_REMOVE_FILE_OBSOLETE:
+@@ -94,6 +97,7 @@ state_cb_rm(const struct xbps_state_cb_data *xscd, void *cbdata UNUSED)
+ 		break;
+ 	/* errors */
+ 	case XBPS_STATE_REMOVE_FAIL:
++	case XBPS_STATE_TRANS_HOOKS_FAIL:
+ 		xbps_error_printf("%s\n", xscd->desc);
+ 		if (slog) {
+ 			syslog(LOG_ERR, "%s", xscd->desc);
+diff --git a/include/xbps.h.in b/include/xbps.h.in
+index 6a35eeb..f285c7b 100644
+--- a/include/xbps.h.in
++++ b/include/xbps.h.in
+@@ -299,6 +299,8 @@ extern "C" {
+  * - XBPS_STATE_TRANS_VERIFY: transaction is verifying binary package integrity.
+  * - XBPS_STATE_TRANS_RUN: transaction is performing operations: install, update, remove, replace.
+  * - XBPS_STATE_TRANS_CONFIGURE: transaction is configuring all unpacked packages.
++ * - XBPS_STATE_TRANS_HOOKS: transaction is running a user-defined pre/post hook.
++ * - XBPS_STATE_TRANS_HOOKS_FAIL: a user-defined transaction hook has failed.
+  * - XBPS_STATE_TRANS_FAIL: transaction has failed.
+  * - XBPS_STATE_DOWNLOAD: a binary package is being downloaded.
+  * - XBPS_STATE_VERIFY: a binary package is being verified.
+@@ -388,7 +390,9 @@ typedef enum xbps_state {
+ 	XBPS_STATE_ALTGROUP_REMOVED,
+ 	XBPS_STATE_ALTGROUP_SWITCHED,
+ 	XBPS_STATE_ALTGROUP_LINK_ADDED,
+-	XBPS_STATE_ALTGROUP_LINK_REMOVED
++	XBPS_STATE_ALTGROUP_LINK_REMOVED,
++	XBPS_STATE_TRANS_HOOKS,
++	XBPS_STATE_TRANS_HOOKS_FAIL
+ } xbps_state_t;
+ 
+ /**
+diff --git a/include/xbps_api_impl.h b/include/xbps_api_impl.h
+index 11aba15..85f3bb4 100644
+--- a/include/xbps_api_impl.h
++++ b/include/xbps_api_impl.h
+@@ -98,6 +98,7 @@ int HIDDEN xbps_transaction_fetch(struct xbps_handle *,
+ 		xbps_object_iterator_t);
+ int HIDDEN xbps_transaction_pkg_deps(struct xbps_handle *, xbps_array_t, xbps_dictionary_t);
+ int HIDDEN xbps_transaction_internalize(struct xbps_handle *, xbps_object_iterator_t);
++int HIDDEN xbps_transaction_hooks(struct xbps_handle *, const char *stage);
+ 
+ char HIDDEN *xbps_get_remote_repo_string(const char *);
+ int HIDDEN xbps_repo_sync(struct xbps_handle *, const char *);
+diff --git a/lib/Makefile b/lib/Makefile
+index 2b4efe4..41f85fa 100644
+--- a/lib/Makefile
++++ b/lib/Makefile
+@@ -38,7 +38,7 @@ EXTOBJS = external/dewey.o external/fexec.o external/mkpath.o
+ OBJS = package_configure.o package_config_files.o package_orphans.o
+ OBJS += package_remove.o package_state.o
+ OBJS += package_unpack.o package_register.o package_script.o verifysig.o
+-OBJS += transaction_commit.o transaction_prepare.o
++OBJS += transaction_commit.o transaction_prepare.o transaction_hooks.o
+ OBJS += transaction_ops.o transaction_store.o transaction_check_replaces.o
+ OBJS += transaction_check_revdeps.o transaction_check_conflicts.o
+ OBJS += transaction_check_shlibs.o
+diff --git a/lib/transaction_commit.c b/lib/transaction_commit.c
+index 122b9f8..0e47d34 100644
+--- a/lib/transaction_commit.c
++++ b/lib/transaction_commit.c
+@@ -208,6 +208,16 @@ xbps_transaction_commit(struct xbps_handle *xhp)
+ 		goto out;
+ 	}
+ 
++	/*
++	 * Run user-defined pre-transaction hooks. A failing pre hook
++	 * aborts the transaction before anything is unpacked/removed.
++	 * Must run after chdir(rootdir) above: xbps_transaction_hooks()
++	 * relies on cwd == rootdir to build a chroot-safe relative exec
++	 * path (same trick xbps_pkg_exec_buffer() uses for pkg scripts).
++	 */
++	if ((rv = xbps_transaction_hooks(xhp, "pre")) != 0)
++		goto out;
++
+ 	/*
+ 	 * Run all pre-remove scripts.
+ 	 * And store the remove scripts in remove_scripts
+@@ -439,6 +449,31 @@ xbps_transaction_commit(struct xbps_handle *xhp)
+ 		}
+ 	}
+ 
++	/*
++	 * Run user-defined post-transaction hooks. Failures here are
++	 * reported but do not change the transaction's own result: the
++	 * install/update/remove already completed successfully by this
++	 * point, and there is nothing left to roll back.
++	 *
++	 * The pkgdb lock is released first: by this point pkgdb has
++	 * already been flushed to disk (see xbps_pkgdb_update() above)
++	 * and nothing in this process touches it again before exit, so
++	 * it's safe to let go of it here. Without this, a hook that
++	 * itself shells out to xbps-install/xbps-remove (a very common
++	 * and legitimate thing to want in a post hook, e.g. clearing the
++	 * package cache) would deadlock forever waiting on the lock this
++	 * same process is still holding. xbps_pkgdb_release() at process
++	 * exit calls xbps_pkgdb_unlock() again, which is a harmless
++	 * no-op once already unlocked.
++	 *
++	 * Pre-transaction hooks deliberately do NOT get this treatment:
++	 * at that point nothing has been written yet, so releasing the
++	 * lock there would let a hook-spawned transaction race with (and
++	 * potentially corrupt) the one that's about to run.
++	 */
++	xbps_pkgdb_unlock(xhp);
++	(void)xbps_transaction_hooks(xhp, "post");
++
+ out:
+ 	xbps_object_release(remove_scripts);
+ 	xbps_object_iterator_release(iter);
+diff --git a/lib/transaction_hooks.c b/lib/transaction_hooks.c
+new file mode 100644
+index 0000000..6c49fa8
+--- /dev/null
++++ b/lib/transaction_hooks.c
+@@ -0,0 +1,631 @@
++/*-
++ * Copyright (c) 2026 Voidbr contributors.
++ * All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR
++ * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
++ * OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
++ * IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT,
++ * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
++ * NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
++ * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ */
++
++#include <sys/stat.h>
++#include <sys/types.h>
++#include <sys/wait.h>
++
++#include <ctype.h>
++#include <dirent.h>
++#include <errno.h>
++#include <fnmatch.h>
++#include <stdbool.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++#include "xbps_api_impl.h"
++
++/**
++ * @file lib/transaction_hooks.c
++ * @brief User-defined transaction hooks (pacman ALPM-hooks-style)
++ *
++ * Hook files live in <confdir>/hooks.d/ as *.hook and use the same
++ * two-section syntax as pacman's alpm-hooks(5):
++ *
++ *   [Trigger]
++ *   Operation = Install
++ *   Operation = Upgrade
++ *   Type = Package
++ *   Target = linux*
++ *
++ *   [Action]
++ *   Description = Rebuilding initramfs...
++ *   When = PostTransaction
++ *   Exec = /usr/bin/dracut --regenerate-all --force
++ *   NeedsTargets
++ *
++ * Supported keys:
++ *   Trigger.Operation  Install | Upgrade | Remove (repeatable)
++ *   Trigger.Type       Package | Path
++ *   Trigger.Target     glob pattern (repeatable); for Type=Package
++ *                      matched against pkgname, for Type=Path matched
++ *                      against installed file paths (see caveat below)
++ *   Action.Description free text, only used for the state callback
++ *   Action.When        PreTransaction | PostTransaction
++ *   Action.Exec        command line (split on whitespace; no shell,
++ *                      no quoting support -- keep it a single binary
++ *                      + plain args, or point it at a wrapper script)
++ *   Action.NeedsTargets bare flag (no value): matched target names
++ *                      are written to the command's stdin, one per
++ *                      line, same as alpm-hooks(5)
++ *
++ * KNOWN LIMITATIONS (documented, not silently papered over):
++ *
++ *  - Exec parsing is a naive whitespace split, unlike pacman's real
++ *    wordsplit (no quoting/escaping support).
++ *  - Type=Path matching uses xbps_pkgdb_get_pkg_files(), i.e. the
++ *    *currently installed* file list for that pkgname. For
++ *    Operation=Remove that list is still correct at PreTransaction
++ *    time (files not removed yet) but is gone by PostTransaction
++ *    (package already removed from pkgdb) -- Path+Remove+Post is a
++ *    known gap and is skipped with a debug message rather than
++ *    silently matching wrong. For Operation=Install/Upgrade,
++ *    PostTransaction works correctly because pkgdb is updated before
++ *    post hooks run; PreTransaction can't see not-yet-installed
++ *    files at all (also skipped).
++ *  - No Depends key, no NeedsTargets file-path granularity beyond
++ *    what's described above.
++ */
++
++#define XBPS_HOOKS_RELDIR "hooks.d"
++#define XBPS_HOOK_EXT ".hook"
++
++struct strv {
++	char **items;
++	size_t count;
++};
++
++struct xbps_hook {
++	/* [Trigger] */
++	struct strv operations;	/* lowercased: "install"/"upgrade"/"remove" */
++	char *type;		/* "package" or "path", lowercased */
++	struct strv targets;
++	/* [Action] */
++	char *description;
++	char *when;		/* "pre" or "post" */
++	char *exec;
++	bool needs_targets;
++};
++
++static void
++strv_free(struct strv *v)
++{
++	for (size_t i = 0; i < v->count; i++)
++		free(v->items[i]);
++	free(v->items);
++	v->items = NULL;
++	v->count = 0;
++}
++
++static int
++strv_add(struct strv *v, const char *s)
++{
++	char **n = realloc(v->items, (v->count + 1) * sizeof(char *));
++	if (n == NULL)
++		return ENOMEM;
++	v->items = n;
++	v->items[v->count] = strdup(s);
++	if (v->items[v->count] == NULL)
++		return ENOMEM;
++	v->count++;
++	return 0;
++}
++
++static void
++hook_free(struct xbps_hook *h)
++{
++	if (h == NULL)
++		return;
++	strv_free(&h->operations);
++	strv_free(&h->targets);
++	free(h->type);
++	free(h->description);
++	free(h->when);
++	free(h->exec);
++	free(h);
++}
++
++static char *
++trim(char *s)
++{
++	char *end;
++
++	while (*s == ' ' || *s == '\t')
++		s++;
++	if (*s == '\0')
++		return s;
++	end = s + strlen(s) - 1;
++	while (end > s && (*end == ' ' || *end == '\t' || *end == '\n' || *end == '\r')) {
++		*end = '\0';
++		end--;
++	}
++	return s;
++}
++
++static char *
++strlower(char *s)
++{
++	for (char *p = s; *p; p++)
++		*p = (char)tolower((unsigned char)*p);
++	return s;
++}
++
++/*
++ * Minimal .hook (INI-like) parser: two sections, "key = value" or
++ * bare "key" (flag, e.g. NeedsTargets) lines, '#' or ';' at the
++ * start of a (trimmed) line is a comment, repeated keys accumulate
++ * (Operation, Target).
++ */
++static struct xbps_hook *
++parse_hook_file(const char *path)
++{
++	FILE *fp;
++	char line[1024];
++	char section = 0; /* 0=none, 't'=Trigger, 'a'=Action */
++	struct xbps_hook *h;
++
++	fp = fopen(path, "r");
++	if (fp == NULL)
++		return NULL;
++
++	h = calloc(1, sizeof(*h));
++	if (h == NULL) {
++		fclose(fp);
++		return NULL;
++	}
++
++	while (fgets(line, sizeof(line), fp) != NULL) {
++		char *l = trim(line);
++		char *key, *val, *eq;
++
++		if (*l == '\0' || *l == '#' || *l == ';')
++			continue;
++
++		if (*l == '[') {
++			if (strcasecmp(l, "[Trigger]") == 0)
++				section = 't';
++			else if (strcasecmp(l, "[Action]") == 0)
++				section = 'a';
++			else
++				section = 0;
++			continue;
++		}
++
++		eq = strchr(l, '=');
++		if (eq != NULL) {
++			*eq = '\0';
++			key = trim(l);
++			val = trim(eq + 1);
++		} else {
++			key = l;
++			val = NULL;
++		}
++
++		if (section == 't') {
++			if (strcasecmp(key, "Operation") == 0 && val) {
++				strv_add(&h->operations, strlower(val));
++			} else if (strcasecmp(key, "Type") == 0 && val) {
++				free(h->type);
++				h->type = strdup(strlower(val));
++			} else if (strcasecmp(key, "Target") == 0 && val) {
++				strv_add(&h->targets, val);
++			}
++		} else if (section == 'a') {
++			if (strcasecmp(key, "Description") == 0 && val) {
++				free(h->description);
++				h->description = strdup(val);
++			} else if (strcasecmp(key, "When") == 0 && val) {
++				free(h->when);
++				if (strcasecmp(val, "PreTransaction") == 0)
++					h->when = strdup("pre");
++				else if (strcasecmp(val, "PostTransaction") == 0)
++					h->when = strdup("post");
++				else
++					h->when = strdup(strlower(val));
++			} else if (strcasecmp(key, "Exec") == 0 && val) {
++				free(h->exec);
++				h->exec = strdup(val);
++			} else if (strcasecmp(key, "NeedsTargets") == 0) {
++				h->needs_targets = true;
++			}
++		}
++	}
++	fclose(fp);
++
++	if (h->type == NULL || h->when == NULL || h->exec == NULL) {
++		xbps_dbg_printf("[hooks] %s: missing required Type/When/Exec, ignoring\n", path);
++		hook_free(h);
++		return NULL;
++	}
++	return h;
++}
++
++static const char *
++op_name(xbps_trans_type_t ttype)
++{
++	switch (ttype) {
++	case XBPS_TRANS_INSTALL:
++	case XBPS_TRANS_REINSTALL:
++		return "install";
++	case XBPS_TRANS_UPDATE:
++		return "upgrade";
++	case XBPS_TRANS_REMOVE:
++		return "remove";
++	default:
++		return NULL;
++	}
++}
++
++static bool
++op_matches(struct xbps_hook *h, xbps_trans_type_t ttype)
++{
++	const char *name = op_name(ttype);
++
++	if (name == NULL)
++		return false;
++	if (h->operations.count == 0)
++		return true;
++	for (size_t i = 0; i < h->operations.count; i++)
++		if (strcmp(h->operations.items[i], name) == 0)
++			return true;
++	return false;
++}
++
++static bool
++target_matches_any(struct strv *targets, const char *value)
++{
++	if (targets->count == 0)
++		return true; /* no Target: matches everything (rare, but valid) */
++	for (size_t i = 0; i < targets->count; i++)
++		if (fnmatch(targets->items[i], value, 0) == 0)
++			return true;
++	return false;
++}
++
++/*
++ * Collects, into `matched`, the set of target strings (pkgnames for
++ * Type=Package, file paths for Type=Path) in the current transaction
++ * that this hook's [Trigger] section matches. Returns true if at
++ * least one match was found (i.e. the hook should run).
++ */
++static bool
++collect_matches(struct xbps_handle *xhp, struct xbps_hook *h, struct strv *matched)
++{
++	xbps_array_t pkgs;
++	bool any = false;
++
++	pkgs = xbps_dictionary_get(xhp->transd, "packages");
++	if (pkgs == NULL)
++		return false;
++
++	for (unsigned int i = 0; i < xbps_array_count(pkgs); i++) {
++		xbps_dictionary_t pkgd = xbps_array_get(pkgs, i);
++		xbps_trans_type_t ttype = xbps_transaction_pkg_type(pkgd);
++		const char *pkgname = NULL;
++
++		if (ttype == XBPS_TRANS_HOLD || ttype == XBPS_TRANS_CONFIGURE)
++			continue;
++		if (!op_matches(h, ttype))
++			continue;
++
++		xbps_dictionary_get_cstring_nocopy(pkgd, "pkgname", &pkgname);
++		if (pkgname == NULL)
++			continue;
++
++		if (strcmp(h->type, "package") == 0) {
++			if (target_matches_any(&h->targets, pkgname)) {
++				strv_add(matched, pkgname);
++				any = true;
++			}
++		} else if (strcmp(h->type, "path") == 0) {
++			xbps_dictionary_t filesd;
++			xbps_array_t a;
++
++			/*
++			 * See the top-of-file caveat: this only works
++			 * for Install/Upgrade at PostTransaction, and
++			 * for Remove at PreTransaction (pkgdb still has
++			 * the file list in both those cases). Anything
++			 * else is skipped rather than guessed at.
++			 */
++			if (ttype == XBPS_TRANS_REMOVE && strcmp(h->when, "post") == 0) {
++				xbps_dbg_printf("[hooks] %s: skipping Type=Path match for "
++				    "removed pkg at PostTransaction (files already "
++				    "gone from pkgdb)\n", pkgname);
++				continue;
++			}
++			if (ttype != XBPS_TRANS_REMOVE && strcmp(h->when, "pre") == 0) {
++				xbps_dbg_printf("[hooks] %s: skipping Type=Path match for "
++				    "install/upgrade at PreTransaction (files not "
++				    "unpacked yet)\n", pkgname);
++				continue;
++			}
++
++			filesd = xbps_pkgdb_get_pkg_files(xhp, pkgname);
++			if (filesd == NULL)
++				continue;
++
++			a = xbps_dictionary_get(filesd, "files");
++			for (unsigned int j = 0; a && j < xbps_array_count(a); j++) {
++				xbps_dictionary_t fd = xbps_array_get(a, j);
++				const char *file = NULL;
++				xbps_dictionary_get_cstring_nocopy(fd, "file", &file);
++				if (file && target_matches_any(&h->targets, file)) {
++					strv_add(matched, pkgname);
++					any = true;
++					break;
++				}
++			}
++		}
++	}
++	return any;
++}
++
++/*
++ * See the fexec.c rationale reused from the earlier revision of this
++ * file: xbps_file_exec()'s underlying fork chroot()s into rootdir
++ * only under specific conditions, and in every case cwd (already
++ * chdir()'d to rootdir by the caller, see transaction_commit.c)
++ * ends up mapping to the right place for a *relative*,
++ * non-rootdir-prefixed path. Hook Exec= lines are expected to be
++ * absolute host paths (like pacman hooks, e.g. "/usr/bin/mkinitcpio");
++ * we only strip the rootdir prefix here, we don't otherwise rewrite
++ * the command.
++ */
++static char *
++relative_to_rootdir(struct xbps_handle *xhp, const char *path)
++{
++	size_t rootlen;
++
++	if (strcmp(xhp->rootdir, "/") == 0)
++		return strdup(path);
++
++	rootlen = strlen(xhp->rootdir);
++	if (strncmp(path, xhp->rootdir, rootlen) != 0)
++		return strdup(path);
++
++	path += rootlen;
++	while (*path == '/')
++		path++;
++	return strdup(path);
++}
++
++/*
++ * Splits `cmd` on whitespace into a NULL-terminated argv. Naive: no
++ * quoting/escaping support (documented limitation, see file header).
++ */
++static char **
++split_exec(const char *cmd)
++{
++	char *copy, *tok, *save;
++	char **argv;
++	size_t n = 0, cap = 8;
++
++	copy = strdup(cmd);
++	if (copy == NULL)
++		return NULL;
++	argv = malloc(cap * sizeof(char *));
++	if (argv == NULL) {
++		free(copy);
++		return NULL;
++	}
++
++	for (tok = strtok_r(copy, " \t", &save); tok != NULL;
++	     tok = strtok_r(NULL, " \t", &save)) {
++		if (n + 1 >= cap) {
++			cap *= 2;
++			argv = realloc(argv, cap * sizeof(char *));
++			if (argv == NULL) {
++				free(copy);
++				return NULL;
++			}
++		}
++		argv[n++] = strdup(tok);
++	}
++	argv[n] = NULL;
++	free(copy);
++	return argv;
++}
++
++/*
++ * Forks, execs the hook's Exec= command (argv[0] rewritten to be
++ * chroot/rootdir-safe, see relative_to_rootdir()), and, if
++ * needs_targets, writes one matched target per line to its stdin.
++ * Mirrors pfcexec() in lib/external/fexec.c but adds stdin piping,
++ * which xbps_file_exec() does not support.
++ */
++static int
++exec_hook_action(struct xbps_handle *xhp, struct xbps_hook *h, struct strv *matched)
++{
++	char **argv;
++	char *execpath;
++	int pipefd[2] = { -1, -1 };
++	pid_t child;
++	int status, rv = 0;
++
++	argv = split_exec(h->exec);
++	if (argv == NULL || argv[0] == NULL) {
++		free(argv);
++		return EINVAL;
++	}
++
++	execpath = relative_to_rootdir(xhp, argv[0]);
++	if (execpath == NULL) {
++		for (char **p = argv; *p; p++)
++			free(*p);
++		free(argv);
++		return ENOMEM;
++	}
++	free(argv[0]);
++	argv[0] = execpath;
++
++	if (h->needs_targets) {
++		if (pipe(pipefd) == -1) {
++			rv = errno;
++			goto out;
++		}
++	}
++
++	child = fork();
++	if (child == -1) {
++		rv = errno;
++		goto out;
++	}
++
++	if (child == 0) {
++		if (h->needs_targets) {
++			dup2(pipefd[0], STDIN_FILENO);
++			close(pipefd[0]);
++			close(pipefd[1]);
++		}
++		if (strcmp(xhp->rootdir, "/") != 0) {
++			if ((geteuid() == 0) && (access("bin/sh", X_OK) == 0)) {
++				if (chroot(xhp->rootdir) == -1)
++					_exit(errno);
++				if (chdir("/") == -1)
++					_exit(errno);
++			}
++		}
++		umask(022);
++		execv(argv[0], argv);
++		_exit(errno);
++	}
++
++	if (h->needs_targets) {
++		FILE *wf;
++		close(pipefd[0]);
++		wf = fdopen(pipefd[1], "w");
++		if (wf != NULL) {
++			for (size_t i = 0; i < matched->count; i++)
++				fprintf(wf, "%s\n", matched->items[i]);
++			fclose(wf); /* also closes pipefd[1] */
++		} else {
++			close(pipefd[1]);
++		}
++	}
++
++	while (waitpid(child, &status, 0) < 0) {
++		if (errno != EINTR) {
++			rv = errno;
++			goto out;
++		}
++	}
++	if (!WIFEXITED(status))
++		rv = ECHILD;
++	else
++		rv = WEXITSTATUS(status);
++
++out:
++	for (char **p = argv; *p; p++)
++		free(*p);
++	free(argv);
++	return rv;
++}
++
++static int
++run_one_hook(struct xbps_handle *xhp, const char *path, const char *stage)
++{
++	struct xbps_hook *h;
++	struct strv matched = { 0 };
++	int rv = 0;
++
++	h = parse_hook_file(path);
++	if (h == NULL)
++		return 0; /* unreadable/malformed hook: already logged, skip */
++
++	if (strcmp(h->when, stage) != 0)
++		goto out;
++
++	if (!collect_matches(xhp, h, &matched))
++		goto out; /* nothing in this transaction matches Target */
++
++	xbps_set_cb_state(xhp, XBPS_STATE_TRANS_HOOKS, 0, path,
++	    "%s", h->description ? h->description : path);
++
++	rv = exec_hook_action(xhp, h, &matched);
++	if (rv != 0) {
++		xbps_dbg_printf("[hooks] %s: exec failed (stage=%s): %s\n",
++		    path, stage, strerror(rv));
++	}
++
++out:
++	strv_free(&matched);
++	hook_free(h);
++	return rv;
++}
++
++int HIDDEN
++xbps_transaction_hooks(struct xbps_handle *xhp, const char *stage)
++{
++	char *dir;
++	struct dirent **namelist = NULL;
++	int n, rv = 0;
++
++	assert(xhp);
++	assert(stage);
++
++	if (xhp->target_arch && strcmp(xhp->native_arch, xhp->target_arch)) {
++		/* cross/target-arch transactions don't run host hooks */
++		return 0;
++	}
++
++	dir = xbps_xasprintf("%s/%s", xhp->confdir, XBPS_HOOKS_RELDIR);
++	if (dir == NULL)
++		return ENOMEM;
++
++	n = scandir(dir, &namelist, NULL, alphasort);
++	if (n < 0) {
++		free(dir);
++		return (errno == ENOENT) ? 0 : errno;
++	}
++
++	for (int i = 0; i < n; i++) {
++		const char *name = namelist[i]->d_name;
++		size_t len = strlen(name);
++		size_t extlen = strlen(XBPS_HOOK_EXT);
++
++		if (len > extlen && strcmp(name + len - extlen, XBPS_HOOK_EXT) == 0) {
++			char *path = xbps_xasprintf("%s/%s", dir, name);
++			int hrv = run_one_hook(xhp, path, stage);
++			/*
++			 * A failing PreTransaction hook aborts the
++			 * transaction, mirroring pacman semantics; a
++			 * failing PostTransaction hook is only logged.
++			 */
++			if (hrv != 0 && strcmp(stage, "pre") == 0 && rv == 0) {
++				rv = hrv;
++				xbps_set_cb_state(xhp, XBPS_STATE_TRANS_HOOKS_FAIL, rv, path,
++				    "[trans] hook failed: %s", path);
++			}
++			free(path);
++		}
++		free(namelist[i]);
++	}
++	free(namelist);
++	free(dir);
++	return rv;
++}
