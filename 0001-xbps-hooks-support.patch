@@ -1,18 +1,21 @@
 diff --git a/bin/xbps-install/state_cb.c b/bin/xbps-install/state_cb.c
-index 350c608..78de04a 100644
+index 350c608..63fc574 100644
 --- a/bin/xbps-install/state_cb.c
 +++ b/bin/xbps-install/state_cb.c
-@@ -62,6 +62,9 @@ state_cb(const struct xbps_state_cb_data *xscd, void *cbdata UNUSED)
+@@ -62,6 +62,12 @@ state_cb(const struct xbps_state_cb_data *xscd, void *cbdata UNUSED)
  	case XBPS_STATE_TRANS_CONFIGURE:
  		printf("\n[*] Configuring unpacked packages\n");
  		break;
 +	case XBPS_STATE_TRANS_HOOKS:
-+		printf("[*] Running hook: %s\n", xscd->desc);
++		if (xscd->desc[0] == '(')
++			printf("%s\n", xscd->desc);
++		else
++			printf("\n[*] %s\n", xscd->desc);
 +		break;
  	case XBPS_STATE_PKGDB:
  		printf("[*] pkgdb upgrade in progress, please wait...\n");
  		break;
-@@ -161,6 +164,7 @@ state_cb(const struct xbps_state_cb_data *xscd, void *cbdata UNUSED)
+@@ -161,6 +167,7 @@ state_cb(const struct xbps_state_cb_data *xscd, void *cbdata UNUSED)
  		break;
  	/* errors */
  	case XBPS_STATE_TRANS_FAIL:
@@ -21,20 +24,23 @@ index 350c608..78de04a 100644
  	case XBPS_STATE_UPDATE_FAIL:
  	case XBPS_STATE_CONFIGURE_FAIL:
 diff --git a/bin/xbps-remove/main.c b/bin/xbps-remove/main.c
-index 1ab4ffc..5b10991 100644
+index 1ab4ffc..ba4d13f 100644
 --- a/bin/xbps-remove/main.c
 +++ b/bin/xbps-remove/main.c
-@@ -78,6 +78,9 @@ state_cb_rm(const struct xbps_state_cb_data *xscd, void *cbdata UNUSED)
+@@ -78,6 +78,12 @@ state_cb_rm(const struct xbps_state_cb_data *xscd, void *cbdata UNUSED)
  	case XBPS_STATE_REMOVE:
  		printf("Removing `%s' ...\n", xscd->arg);
  		break;
 +	case XBPS_STATE_TRANS_HOOKS:
-+		printf("[*] Running hook: %s\n", xscd->desc);
++		if (xscd->desc[0] == '(')
++			printf("%s\n", xscd->desc);
++		else
++			printf("\n[*] %s\n", xscd->desc);
 +		break;
  	/* success */
  	case XBPS_STATE_REMOVE_FILE:
  	case XBPS_STATE_REMOVE_FILE_OBSOLETE:
-@@ -94,6 +97,7 @@ state_cb_rm(const struct xbps_state_cb_data *xscd, void *cbdata UNUSED)
+@@ -94,6 +100,7 @@ state_cb_rm(const struct xbps_state_cb_data *xscd, void *cbdata UNUSED)
  		break;
  	/* errors */
  	case XBPS_STATE_REMOVE_FAIL:
@@ -146,10 +152,10 @@ index 122b9f8..0e47d34 100644
  	xbps_object_iterator_release(iter);
 diff --git a/lib/transaction_hooks.c b/lib/transaction_hooks.c
 new file mode 100644
-index 0000000..6c49fa8
+index 0000000..818d3fc
 --- /dev/null
 +++ b/lib/transaction_hooks.c
-@@ -0,0 +1,631 @@
+@@ -0,0 +1,677 @@
 +/*-
 + * Copyright (c) 2026 Voidbr contributors.
 + * All rights reserved.
@@ -698,37 +704,11 @@ index 0000000..6c49fa8
 +	return rv;
 +}
 +
-+static int
-+run_one_hook(struct xbps_handle *xhp, const char *path, const char *stage)
-+{
++struct pending_hook {
++	char *path;
 +	struct xbps_hook *h;
-+	struct strv matched = { 0 };
-+	int rv = 0;
-+
-+	h = parse_hook_file(path);
-+	if (h == NULL)
-+		return 0; /* unreadable/malformed hook: already logged, skip */
-+
-+	if (strcmp(h->when, stage) != 0)
-+		goto out;
-+
-+	if (!collect_matches(xhp, h, &matched))
-+		goto out; /* nothing in this transaction matches Target */
-+
-+	xbps_set_cb_state(xhp, XBPS_STATE_TRANS_HOOKS, 0, path,
-+	    "%s", h->description ? h->description : path);
-+
-+	rv = exec_hook_action(xhp, h, &matched);
-+	if (rv != 0) {
-+		xbps_dbg_printf("[hooks] %s: exec failed (stage=%s): %s\n",
-+		    path, stage, strerror(rv));
-+	}
-+
-+out:
-+	strv_free(&matched);
-+	hook_free(h);
-+	return rv;
-+}
++	struct strv matched;
++};
 +
 +int HIDDEN
 +xbps_transaction_hooks(struct xbps_handle *xhp, const char *stage)
@@ -736,6 +716,8 @@ index 0000000..6c49fa8
 +	char *dir;
 +	struct dirent **namelist = NULL;
 +	int n, rv = 0;
++	struct pending_hook *pending = NULL;
++	size_t npending = 0, capending = 0;
 +
 +	assert(xhp);
 +	assert(stage);
@@ -755,29 +737,99 @@ index 0000000..6c49fa8
 +		return (errno == ENOENT) ? 0 : errno;
 +	}
 +
++	/*
++	 * First pass: parse every *.hook file and figure out which ones
++	 * actually apply to this stage and this transaction, so we can
++	 * report "(i/total)" the same way pacman's hook runner does,
++	 * instead of numbering files that end up not matching anything.
++	 */
 +	for (int i = 0; i < n; i++) {
 +		const char *name = namelist[i]->d_name;
 +		size_t len = strlen(name);
 +		size_t extlen = strlen(XBPS_HOOK_EXT);
++		char *path;
++		struct xbps_hook *h;
++		struct strv matched = { 0 };
 +
-+		if (len > extlen && strcmp(name + len - extlen, XBPS_HOOK_EXT) == 0) {
-+			char *path = xbps_xasprintf("%s/%s", dir, name);
-+			int hrv = run_one_hook(xhp, path, stage);
++		free(namelist[i]);
++		if (len <= extlen || strcmp(name + len - extlen, XBPS_HOOK_EXT) != 0)
++			continue;
++
++		path = xbps_xasprintf("%s/%s", dir, name);
++		if (path == NULL)
++			continue;
++
++		h = parse_hook_file(path);
++		if (h == NULL) {
++			free(path);
++			continue;
++		}
++		if (strcmp(h->when, stage) != 0 || !collect_matches(xhp, h, &matched)) {
++			strv_free(&matched);
++			hook_free(h);
++			free(path);
++			continue;
++		}
++
++		if (npending == capending) {
++			size_t newcap = capending ? capending * 2 : 4;
++			struct pending_hook *np = realloc(pending, newcap * sizeof(*np));
++			if (np == NULL) {
++				strv_free(&matched);
++				hook_free(h);
++				free(path);
++				continue;
++			}
++			pending = np;
++			capending = newcap;
++		}
++		pending[npending].path = path;
++		pending[npending].h = h;
++		pending[npending].matched = matched;
++		npending++;
++	}
++	free(namelist);
++	free(dir);
++
++	if (npending == 0) {
++		free(pending);
++		return 0;
++	}
++
++	xbps_set_cb_state(xhp, XBPS_STATE_TRANS_HOOKS, 0, stage,
++	    "Running %s-transaction hooks", stage);
++
++	/*
++	 * Second pass: actually run them, numbered (i/total) like
++	 * pacman's "(1/2) ..." hook progress output.
++	 */
++	for (size_t i = 0; i < npending; i++) {
++		struct pending_hook *p = &pending[i];
++		const char *desc = p->h->description ? p->h->description : p->path;
++		int hrv;
++
++		xbps_set_cb_state(xhp, XBPS_STATE_TRANS_HOOKS, 0, stage,
++		    "(%zu/%zu) %s", i + 1, npending, desc);
++
++		hrv = exec_hook_action(xhp, p->h, &p->matched);
++		if (hrv != 0) {
++			xbps_dbg_printf("[hooks] %s: exec failed (stage=%s): %s\n",
++			    p->path, stage, strerror(hrv));
 +			/*
 +			 * A failing PreTransaction hook aborts the
 +			 * transaction, mirroring pacman semantics; a
 +			 * failing PostTransaction hook is only logged.
 +			 */
-+			if (hrv != 0 && strcmp(stage, "pre") == 0 && rv == 0) {
++			if (strcmp(stage, "pre") == 0 && rv == 0) {
 +				rv = hrv;
-+				xbps_set_cb_state(xhp, XBPS_STATE_TRANS_HOOKS_FAIL, rv, path,
-+				    "[trans] hook failed: %s", path);
++				xbps_set_cb_state(xhp, XBPS_STATE_TRANS_HOOKS_FAIL, rv, p->path,
++				    "[trans] hook failed: %s", p->path);
 +			}
-+			free(path);
 +		}
-+		free(namelist[i]);
++		strv_free(&p->matched);
++		hook_free(p->h);
++		free(p->path);
 +	}
-+	free(namelist);
-+	free(dir);
++	free(pending);
 +	return rv;
 +}
