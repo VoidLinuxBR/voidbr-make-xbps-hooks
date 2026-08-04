@@ -362,7 +362,7 @@ index 2b4efe4..41f85fa 100644
  OBJS += transaction_check_revdeps.o transaction_check_conflicts.o
  OBJS += transaction_check_shlibs.o
 diff --git a/lib/transaction_commit.c b/lib/transaction_commit.c
-index 122b9f8..941d185 100644
+index 122b9f8..5330d23 100644
 --- a/lib/transaction_commit.c
 +++ b/lib/transaction_commit.c
 @@ -108,6 +108,7 @@ xbps_transaction_commit(struct xbps_handle *xhp)
@@ -413,7 +413,7 @@ index 122b9f8..941d185 100644
  	/*
  	 * Run all post and purge-remove scripts.
  	 */
-@@ -439,10 +466,42 @@ xbps_transaction_commit(struct xbps_handle *xhp)
+@@ -439,10 +466,95 @@ xbps_transaction_commit(struct xbps_handle *xhp)
  		}
  	}
  
@@ -451,8 +451,61 @@ index 122b9f8..941d185 100644
 +		 * above the unlock point) would deadlock the process
 +		 * against itself.
 +		 */
-+		if (pkgdb_unlocked && xbps_pkgdb_lock(xhp) < 0)
-+			return errno;
++		if (pkgdb_unlocked) {
++			xbps_dictionary_t fresh, ours;
++			xbps_array_t pkgs;
++			unsigned int i;
++
++			if (xbps_pkgdb_lock(xhp) < 0)
++				return errno;
++			/*
++			 * While the lock was released, a package script
++			 * or a transaction hook may have spawned its own
++			 * xbps-install/xbps-remove and modified pkgdb on
++			 * disk (e.g. removed some other, unrelated
++			 * package). This process's in-memory xhp->pkgdb
++			 * still reflects the state from right after this
++			 * transaction's own packages were unpacked/
++			 * configured -- it has no idea about that
++			 * external change. Blindly flushing it now would
++			 * silently undo whatever the nested process did
++			 * (a hook removing package X would have X
++			 * resurrected in pkgdb metadata here, even though
++			 * X's files are already gone from disk).
++			 *
++			 * Re-read the current on-disk pkgdb and re-apply
++			 * only *this* transaction's own package state
++			 * changes on top of it, instead of overwriting
++			 * the whole thing with our now-partially-stale
++			 * copy.
++			 */
++			fresh = xbps_dictionary_internalize_from_file(xhp->pkgdb_plist);
++			if (fresh == NULL)
++				fresh = xbps_dictionary_create();
++
++			ours = xhp->pkgdb;
++			pkgs = xbps_dictionary_get(xhp->transd, "packages");
++			for (i = 0; i < xbps_array_count(pkgs); i++) {
++				xbps_dictionary_t pkgd = xbps_array_get(pkgs, i);
++				xbps_trans_type_t pttype = xbps_transaction_pkg_type(pkgd);
++				const char *tpkgname = NULL;
++
++				xbps_dictionary_get_cstring_nocopy(pkgd, "pkgname", &tpkgname);
++				if (tpkgname == NULL)
++					continue;
++
++				if (pttype == XBPS_TRANS_REMOVE) {
++					xbps_dictionary_remove(fresh, tpkgname);
++				} else {
++					xbps_dictionary_t updated =
++					    xbps_dictionary_get(ours, tpkgname);
++					if (updated != NULL)
++						xbps_dictionary_set(fresh, tpkgname, updated);
++				}
++			}
++			xbps_object_release(ours);
++			xhp->pkgdb = fresh;
++		}
  		/* Force a pkgdb write for all unpacked pkgs in transaction */
  		rv = xbps_pkgdb_update(xhp, true, true);
  	}
@@ -1139,3 +1192,90 @@ index 0000000..818d3fc
 +	free(pending);
 +	return rv;
 +}
+diff --git a/lib/transaction_ops.c b/lib/transaction_ops.c
+index 7dd3ffd..f42f2cf 100644
+--- a/lib/transaction_ops.c
++++ b/lib/transaction_ops.c
+@@ -239,9 +239,17 @@ trans_find_pkg(struct xbps_handle *xhp, const char *pkg, bool force)
+ 
+ /*
+  * Returns 1 if there's an update, 0 if none or -1 on error.
++ * If pkgname_out is non-NULL, it's filled with the real pkgname that
++ * provides "xbps" (which may not literally be "xbps" -- e.g. a
++ * derivative distro's own fork/replacement package), resolved via
++ * xbps_pkgdb_get_virtualpkg() below. Callers that need to check
++ * "is the pkg the user asked to update the one that provides xbps"
++ * should compare against this, not against the literal string
++ * "xbps" -- a hardcoded strcmp(pkg, "xbps") silently breaks for any
++ * package that replaces/provides xbps under a different name.
+  */
+ static int
+-xbps_autoupdate(struct xbps_handle *xhp)
++xbps_autoupdate(struct xbps_handle *xhp, char *pkgname_out, size_t pkgname_out_len)
+ {
+ 	xbps_array_t rdeps;
+ 	xbps_dictionary_t pkgd;
+@@ -262,6 +270,8 @@ xbps_autoupdate(struct xbps_handle *xhp)
+ 	if (!xbps_dictionary_get_cstring_nocopy(pkgd, "pkgname", &pkgname)) {
+ 		return EINVAL;
+ 	}
++	if (pkgname_out != NULL)
++		xbps_strlcpy(pkgname_out, pkgname, pkgname_out_len);
+ 
+ 	rv = trans_find_pkg(xhp, pkgname, false);
+ 
+@@ -319,7 +329,7 @@ xbps_transaction_update_packages(struct xbps_handle *xhp)
+ 	bool newpkg_found = false;
+ 	int rv = 0;
+ 
+-	rv = xbps_autoupdate(xhp);
++	rv = xbps_autoupdate(xhp, NULL, 0);
+ 	switch (rv) {
+ 	case 1:
+ 		/* xbps needs to be updated, don't allow any other update */
+@@ -367,14 +377,20 @@ int
+ xbps_transaction_update_pkg(struct xbps_handle *xhp, const char *pkg, bool force)
+ {
+ 	xbps_array_t rdeps;
++	char xbps_pkgname[XBPS_NAME_SIZE] = {0};
+ 	int rv;
+ 
+-	rv = xbps_autoupdate(xhp);
++	rv = xbps_autoupdate(xhp, xbps_pkgname, sizeof(xbps_pkgname));
+ 	xbps_dbg_printf("%s: xbps_autoupdate %d\n", __func__, rv);
+ 	switch (rv) {
+ 	case 1:
+-		/* xbps needs to be updated, only allow xbps to be updated */
+-		if (strcmp(pkg, "xbps"))
++		/*
++		 * xbps needs to be updated, only allow the package that
++		 * actually provides "xbps" to be updated (may not
++		 * literally be named "xbps" -- e.g. a distro's own fork
++		 * that replaces/provides it under a different name).
++		 */
++		if (strcmp(pkg, "xbps") && strcmp(pkg, xbps_pkgname))
+ 			return EBUSY;
+ 		return 0;
+ 	case -1:
+@@ -415,13 +431,18 @@ int
+ xbps_transaction_install_pkg(struct xbps_handle *xhp, const char *pkg, bool force)
+ {
+ 	xbps_array_t rdeps;
++	char xbps_pkgname[XBPS_NAME_SIZE] = {0};
+ 	int rv;
+ 
+-	rv = xbps_autoupdate(xhp);
++	rv = xbps_autoupdate(xhp, xbps_pkgname, sizeof(xbps_pkgname));
+ 	switch (rv) {
+ 	case 1:
+-		/* xbps needs to be updated, only allow xbps to be updated */
+-		if (strcmp(pkg, "xbps"))
++		/*
++		 * xbps needs to be updated, only allow the package that
++		 * actually provides "xbps" to be updated (may not
++		 * literally be named "xbps" -- see xbps_autoupdate()).
++		 */
++		if (strcmp(pkg, "xbps") && strcmp(pkg, xbps_pkgname))
+ 			return EBUSY;
+ 		return 0;
+ 	case -1:
