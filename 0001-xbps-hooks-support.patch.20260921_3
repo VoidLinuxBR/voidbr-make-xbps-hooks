@@ -1377,73 +1377,10 @@ index 0000000..818d3fc
 +	return rv;
 +}
 diff --git a/lib/transaction_ops.c b/lib/transaction_ops.c
-index 7dd3ffd..58d7a9e 100644
+index 7dd3ffd..baf434d 100644
 --- a/lib/transaction_ops.c
 +++ b/lib/transaction_ops.c
-@@ -51,6 +51,37 @@
-  * Text inside of white boxes are the key associated with the object, its
-  * data type is specified on its edge, i.e string, array, integer, dictionary.
-  */
-+/*
-+ * Returns true if any pattern in `arr` (a "conflicts" or "replaces"
-+ * array) names pkgname. Used so a virtual package's installed
-+ * provider that explicitly conflicts with/replaces the literal
-+ * target name is never abandoned in favor of that literal package --
-+ * see the comment where this is used, in trans_find_pkg().
-+ */
-+static bool
-+array_names_pkg(xbps_array_t arr, const char *pkgname)
-+{
-+	unsigned int i;
-+
-+	if (arr == NULL || pkgname == NULL)
-+		return false;
-+
-+	for (i = 0; i < xbps_array_count(arr); i++) {
-+		const char *pattern = NULL;
-+		char patname[XBPS_NAME_SIZE] = {0};
-+
-+		if (!xbps_array_get_cstring_nocopy(arr, i, &pattern))
-+			continue;
-+		if (!xbps_pkgpattern_name(patname, sizeof(patname), pattern) &&
-+		    !xbps_pkg_name(patname, sizeof(patname), pattern)) {
-+			xbps_strlcpy(patname, pattern, sizeof(patname));
-+		}
-+		if (strcmp(patname, pkgname) == 0)
-+			return true;
-+	}
-+	return false;
-+}
-+
- static int
- trans_find_pkg(struct xbps_handle *xhp, const char *pkg, bool force)
- {
-@@ -85,9 +116,21 @@ trans_find_pkg(struct xbps_handle *xhp, const char *pkg, bool force)
- 	}
- 
- 	if (vpkg_pkgdb) {
--		// virtual package installed, if there is no real package in
--		// the rpool, we are keeping the virtual package.
--		pkg_repod = xbps_rpool_get_pkg(xhp, pkg);
-+		// virtual package installed. Only consider switching to a
-+		// literally-named real package from the repo pool if the
-+		// installed provider doesn't itself declare that it
-+		// conflicts with or replaces that exact name -- e.g. a
-+		// distro's own xbps fork that provides "xbps" but
-+		// explicitly conflicts=/replaces= the real xbps package.
-+		// Blindly switching to the real package in that case
-+		// fails outright with unresolvable conflicts/shlibs
-+		// (the fork already replaced what the real package
-+		// depends on), or would silently downgrade/replace the
-+		// fork the person actually has installed.
-+		if (!array_names_pkg(xbps_dictionary_get(vpkg_pkgdb, "conflicts"), pkg) &&
-+		    !array_names_pkg(xbps_dictionary_get(vpkg_pkgdb, "replaces"), pkg)) {
-+			pkg_repod = xbps_rpool_get_pkg(xhp, pkg);
-+		}
- 		if (!pkg_repod) {
- 			pkg_pkgdb = vpkg_pkgdb;
- 			// if we are using the installed virtual package,
-@@ -239,9 +282,17 @@ trans_find_pkg(struct xbps_handle *xhp, const char *pkg, bool force)
+@@ -239,9 +239,17 @@ trans_find_pkg(struct xbps_handle *xhp, const char *pkg, bool force)
  
  /*
   * Returns 1 if there's an update, 0 if none or -1 on error.
@@ -1462,7 +1399,7 @@ index 7dd3ffd..58d7a9e 100644
  {
  	xbps_array_t rdeps;
  	xbps_dictionary_t pkgd;
-@@ -262,6 +313,8 @@ xbps_autoupdate(struct xbps_handle *xhp)
+@@ -262,6 +270,8 @@ xbps_autoupdate(struct xbps_handle *xhp)
  	if (!xbps_dictionary_get_cstring_nocopy(pkgd, "pkgname", &pkgname)) {
  		return EINVAL;
  	}
@@ -1471,7 +1408,7 @@ index 7dd3ffd..58d7a9e 100644
  
  	rv = trans_find_pkg(xhp, pkgname, false);
  
-@@ -310,16 +363,95 @@ xbps_autoupdate(struct xbps_handle *xhp)
+@@ -310,16 +320,95 @@ xbps_autoupdate(struct xbps_handle *xhp)
  	return 0;
  }
  
@@ -1568,7 +1505,7 @@ index 7dd3ffd..58d7a9e 100644
  	switch (rv) {
  	case 1:
  		/* xbps needs to be updated, don't allow any other update */
-@@ -331,11 +463,14 @@ xbps_transaction_update_packages(struct xbps_handle *xhp)
+@@ -331,11 +420,14 @@ xbps_transaction_update_packages(struct xbps_handle *xhp)
  		break;
  	}
  
@@ -1583,7 +1520,7 @@ index 7dd3ffd..58d7a9e 100644
  		char pkgname[XBPS_NAME_SIZE] = {0};
  
  		pkgd = xbps_dictionary_get_keysym(xhp->pkgdb, obj);
-@@ -346,8 +481,46 @@ xbps_transaction_update_packages(struct xbps_handle *xhp)
+@@ -346,8 +438,46 @@ xbps_transaction_update_packages(struct xbps_handle *xhp)
  			rv = EINVAL;
  			break;
  		}
@@ -1630,7 +1567,7 @@ index 7dd3ffd..58d7a9e 100644
  		if (rv == 0) {
  			newpkg_found = true;
  		} else if (rv == ENOENT || rv == EEXIST || rv == ENODEV) {
-@@ -359,6 +532,8 @@ xbps_transaction_update_packages(struct xbps_handle *xhp)
+@@ -359,6 +489,8 @@ xbps_transaction_update_packages(struct xbps_handle *xhp)
  		}
  	}
  	xbps_object_iterator_release(iter);
@@ -1639,7 +1576,7 @@ index 7dd3ffd..58d7a9e 100644
  
  	return newpkg_found ? rv : EEXIST;
  }
-@@ -367,14 +542,20 @@ int
+@@ -367,14 +499,20 @@ int
  xbps_transaction_update_pkg(struct xbps_handle *xhp, const char *pkg, bool force)
  {
  	xbps_array_t rdeps;
@@ -1663,7 +1600,7 @@ index 7dd3ffd..58d7a9e 100644
  			return EBUSY;
  		return 0;
  	case -1:
-@@ -415,13 +596,18 @@ int
+@@ -415,13 +553,18 @@ int
  xbps_transaction_install_pkg(struct xbps_handle *xhp, const char *pkg, bool force)
  {
  	xbps_array_t rdeps;
