@@ -1377,7 +1377,7 @@ index 0000000..818d3fc
 +	return rv;
 +}
 diff --git a/lib/transaction_ops.c b/lib/transaction_ops.c
-index 7dd3ffd..03ec864 100644
+index 7dd3ffd..58d7a9e 100644
 --- a/lib/transaction_ops.c
 +++ b/lib/transaction_ops.c
 @@ -51,6 +51,37 @@
@@ -1418,7 +1418,7 @@ index 7dd3ffd..03ec864 100644
  static int
  trans_find_pkg(struct xbps_handle *xhp, const char *pkg, bool force)
  {
-@@ -85,9 +116,28 @@ trans_find_pkg(struct xbps_handle *xhp, const char *pkg, bool force)
+@@ -85,9 +116,21 @@ trans_find_pkg(struct xbps_handle *xhp, const char *pkg, bool force)
  	}
  
  	if (vpkg_pkgdb) {
@@ -1436,21 +1436,14 @@ index 7dd3ffd..03ec864 100644
 +		// (the fork already replaced what the real package
 +		// depends on), or would silently downgrade/replace the
 +		// fork the person actually has installed.
-+		//
-+		// `force` (-f) is the deliberate escape hatch: a person
-+		// who explicitly asks to force this exact package (not a
-+		// routine -Syu) is presumed to know they're overriding an
-+		// intentional replaces=/conflicts= relationship -- e.g.
-+		// swapping a minimal "-stub" package for the real thing.
-+		if (force ||
-+		    (!array_names_pkg(xbps_dictionary_get(vpkg_pkgdb, "conflicts"), pkg) &&
-+		     !array_names_pkg(xbps_dictionary_get(vpkg_pkgdb, "replaces"), pkg))) {
++		if (!array_names_pkg(xbps_dictionary_get(vpkg_pkgdb, "conflicts"), pkg) &&
++		    !array_names_pkg(xbps_dictionary_get(vpkg_pkgdb, "replaces"), pkg)) {
 +			pkg_repod = xbps_rpool_get_pkg(xhp, pkg);
 +		}
  		if (!pkg_repod) {
  			pkg_pkgdb = vpkg_pkgdb;
  			// if we are using the installed virtual package,
-@@ -239,9 +289,17 @@ trans_find_pkg(struct xbps_handle *xhp, const char *pkg, bool force)
+@@ -239,9 +282,17 @@ trans_find_pkg(struct xbps_handle *xhp, const char *pkg, bool force)
  
  /*
   * Returns 1 if there's an update, 0 if none or -1 on error.
@@ -1469,7 +1462,7 @@ index 7dd3ffd..03ec864 100644
  {
  	xbps_array_t rdeps;
  	xbps_dictionary_t pkgd;
-@@ -262,6 +320,8 @@ xbps_autoupdate(struct xbps_handle *xhp)
+@@ -262,6 +313,8 @@ xbps_autoupdate(struct xbps_handle *xhp)
  	if (!xbps_dictionary_get_cstring_nocopy(pkgd, "pkgname", &pkgname)) {
  		return EINVAL;
  	}
@@ -1478,7 +1471,7 @@ index 7dd3ffd..03ec864 100644
  
  	rv = trans_find_pkg(xhp, pkgname, false);
  
-@@ -310,16 +370,95 @@ xbps_autoupdate(struct xbps_handle *xhp)
+@@ -310,16 +363,95 @@ xbps_autoupdate(struct xbps_handle *xhp)
  	return 0;
  }
  
@@ -1575,7 +1568,7 @@ index 7dd3ffd..03ec864 100644
  	switch (rv) {
  	case 1:
  		/* xbps needs to be updated, don't allow any other update */
-@@ -331,11 +470,14 @@ xbps_transaction_update_packages(struct xbps_handle *xhp)
+@@ -331,11 +463,14 @@ xbps_transaction_update_packages(struct xbps_handle *xhp)
  		break;
  	}
  
@@ -1590,7 +1583,7 @@ index 7dd3ffd..03ec864 100644
  		char pkgname[XBPS_NAME_SIZE] = {0};
  
  		pkgd = xbps_dictionary_get_keysym(xhp->pkgdb, obj);
-@@ -346,8 +488,46 @@ xbps_transaction_update_packages(struct xbps_handle *xhp)
+@@ -346,8 +481,46 @@ xbps_transaction_update_packages(struct xbps_handle *xhp)
  			rv = EINVAL;
  			break;
  		}
@@ -1637,7 +1630,7 @@ index 7dd3ffd..03ec864 100644
  		if (rv == 0) {
  			newpkg_found = true;
  		} else if (rv == ENOENT || rv == EEXIST || rv == ENODEV) {
-@@ -359,6 +539,8 @@ xbps_transaction_update_packages(struct xbps_handle *xhp)
+@@ -359,6 +532,8 @@ xbps_transaction_update_packages(struct xbps_handle *xhp)
  		}
  	}
  	xbps_object_iterator_release(iter);
@@ -1646,7 +1639,7 @@ index 7dd3ffd..03ec864 100644
  
  	return newpkg_found ? rv : EEXIST;
  }
-@@ -367,14 +549,20 @@ int
+@@ -367,14 +542,20 @@ int
  xbps_transaction_update_pkg(struct xbps_handle *xhp, const char *pkg, bool force)
  {
  	xbps_array_t rdeps;
@@ -1670,7 +1663,7 @@ index 7dd3ffd..03ec864 100644
  			return EBUSY;
  		return 0;
  	case -1:
-@@ -415,13 +603,18 @@ int
+@@ -415,13 +596,18 @@ int
  xbps_transaction_install_pkg(struct xbps_handle *xhp, const char *pkg, bool force)
  {
  	xbps_array_t rdeps;
