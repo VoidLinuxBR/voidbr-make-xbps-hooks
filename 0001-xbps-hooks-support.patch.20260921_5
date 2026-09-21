@@ -38,7 +38,7 @@ index 34680b2..e7933d2 100644
  
  /* from question.c */
 diff --git a/bin/xbps-install/main.c b/bin/xbps-install/main.c
-index 8f8be81..41c543c 100644
+index 8f8be81..20c462e 100644
 --- a/bin/xbps-install/main.c
 +++ b/bin/xbps-install/main.c
 @@ -36,6 +36,7 @@
@@ -49,18 +49,7 @@ index 8f8be81..41c543c 100644
  
  static void __attribute__((noreturn))
  usage(bool fail)
-@@ -49,7 +50,9 @@ usage(bool fail)
- 	    " -d, --debug                 Debug mode shown to stderr\n"
- 	    " -D, --download-only         Download packages and check integrity, nothing else\n"
- 	    " -f, --force                 Force package re-installation\n"
--	    "                             If specified twice, all files will be overwritten.\n"
-+	    "                             If specified twice, all files will be overwritten\n"
-+	    "                             and a package explicitly named on the command\n"
-+	    "                             line may replace one that conflicts with/replaces it\n"
- 	    " -h, --help                  Show usage\n"
- 	    " -i, --ignore-conf-repos     Ignore repositories defined in xbps.d\n"
- 	    " -I, --ignore-file-conflicts Ignore detected file conflicts\n"
-@@ -57,6 +60,10 @@ usage(bool fail)
+@@ -57,6 +58,10 @@ usage(bool fail)
  	    " -M, --memory-sync           Remote repository data is fetched and stored\n"
  	    "                             in memory, ignoring on-disk repodata archives\n"
  	    " -n, --dry-run               Dry-run mode\n"
@@ -71,7 +60,7 @@ index 8f8be81..41c543c 100644
  	    " -R, --repository <url>      Add repository to the top of the list\n"
  	    "                             This option can be specified multiple times\n"
  	    " -r, --rootdir <dir>         Full path to rootdir\n"
-@@ -97,7 +104,7 @@ repo_import_key_cb(struct xbps_repo *repo, void *arg UNUSED, bool *done UNUSED)
+@@ -97,7 +102,7 @@ repo_import_key_cb(struct xbps_repo *repo, void *arg UNUSED, bool *done UNUSED)
  int
  main(int argc, char **argv)
  {
@@ -80,7 +69,7 @@ index 8f8be81..41c543c 100644
  	const struct option longopts[] = {
  		{ "automatic", no_argument, NULL, 'A' },
  		{ "config", required_argument, NULL, 'C' },
-@@ -110,6 +117,8 @@ main(int argc, char **argv)
+@@ -110,6 +115,8 @@ main(int argc, char **argv)
  		{ "ignore-file-conflicts", no_argument, NULL, 'I' },
  		{ "memory-sync", no_argument, NULL, 'M' },
  		{ "dry-run", no_argument, NULL, 'n' },
@@ -89,7 +78,7 @@ index 8f8be81..41c543c 100644
  		{ "repository", required_argument, NULL, 'R' },
  		{ "rootdir", required_argument, NULL, 'r' },
  		{ "sync", no_argument, NULL, 'S' },
-@@ -125,13 +134,13 @@ main(int argc, char **argv)
+@@ -125,13 +132,13 @@ main(int argc, char **argv)
  	struct xbps_handle xh;
  	struct xferstat xfer;
  	const char *rootdir, *cachedir, *confdir;
@@ -106,7 +95,7 @@ index 8f8be81..41c543c 100644
  
  	memset(&xh, 0, sizeof(xh));
  
-@@ -179,6 +188,12 @@ main(int argc, char **argv)
+@@ -179,6 +186,12 @@ main(int argc, char **argv)
  		case 'n':
  			drun = true;
  			break;
@@ -119,7 +108,7 @@ index 8f8be81..41c543c 100644
  		case 'R':
  			xbps_repo_store(&xh, optarg);
  			break;
-@@ -209,7 +224,7 @@ main(int argc, char **argv)
+@@ -209,7 +222,7 @@ main(int argc, char **argv)
  			/* NOTREACHED */
  		}
  	}
@@ -128,7 +117,7 @@ index 8f8be81..41c543c 100644
  		usage(true);
  
  	/*
-@@ -249,7 +264,7 @@ main(int argc, char **argv)
+@@ -249,7 +262,7 @@ main(int argc, char **argv)
  		}
  	}
  
@@ -137,7 +126,7 @@ index 8f8be81..41c543c 100644
  		exit(EXIT_SUCCESS);
  
  	if (!(xh.flags & XBPS_FLAG_DOWNLOAD_ONLY) && !drun) {
-@@ -259,11 +274,39 @@ main(int argc, char **argv)
+@@ -259,11 +272,39 @@ main(int argc, char **argv)
  		}
  	}
  
@@ -1388,7 +1377,7 @@ index 0000000..818d3fc
 +	return rv;
 +}
 diff --git a/lib/transaction_ops.c b/lib/transaction_ops.c
-index 7dd3ffd..1ab33d0 100644
+index 7dd3ffd..03ec864 100644
 --- a/lib/transaction_ops.c
 +++ b/lib/transaction_ops.c
 @@ -51,6 +51,37 @@
@@ -1429,7 +1418,7 @@ index 7dd3ffd..1ab33d0 100644
  static int
  trans_find_pkg(struct xbps_handle *xhp, const char *pkg, bool force)
  {
-@@ -85,9 +116,34 @@ trans_find_pkg(struct xbps_handle *xhp, const char *pkg, bool force)
+@@ -85,9 +116,28 @@ trans_find_pkg(struct xbps_handle *xhp, const char *pkg, bool force)
  	}
  
  	if (vpkg_pkgdb) {
@@ -1448,18 +1437,12 @@ index 7dd3ffd..1ab33d0 100644
 +		// depends on), or would silently downgrade/replace the
 +		// fork the person actually has installed.
 +		//
-+		// The escape hatch is `-ff` (force specified *twice*,
-+		// XBPS_FLAG_FORCE_UNPACK), not plain `-f`: a single -f is
-+		// commonly typed out of habit alongside -Syu (e.g.
-+		// `-Syuf`) for its ordinary meaning (force reinstall) and
-+		// must never silently also override a deliberate
-+		// conflicts=/replaces= relationship -- that already
-+		// happened once and broke a fork's own package manager.
-+		// Requiring the stronger, rarely-typed -ff for this
-+		// specific override keeps the common case safe while
-+		// still letting someone explicitly swap e.g. a minimal
-+		// "-stub" package for the real thing when they mean to.
-+		if ((xhp->flags & XBPS_FLAG_FORCE_UNPACK) ||
++		// `force` (-f) is the deliberate escape hatch: a person
++		// who explicitly asks to force this exact package (not a
++		// routine -Syu) is presumed to know they're overriding an
++		// intentional replaces=/conflicts= relationship -- e.g.
++		// swapping a minimal "-stub" package for the real thing.
++		if (force ||
 +		    (!array_names_pkg(xbps_dictionary_get(vpkg_pkgdb, "conflicts"), pkg) &&
 +		     !array_names_pkg(xbps_dictionary_get(vpkg_pkgdb, "replaces"), pkg))) {
 +			pkg_repod = xbps_rpool_get_pkg(xhp, pkg);
@@ -1467,7 +1450,7 @@ index 7dd3ffd..1ab33d0 100644
  		if (!pkg_repod) {
  			pkg_pkgdb = vpkg_pkgdb;
  			// if we are using the installed virtual package,
-@@ -239,9 +295,17 @@ trans_find_pkg(struct xbps_handle *xhp, const char *pkg, bool force)
+@@ -239,9 +289,17 @@ trans_find_pkg(struct xbps_handle *xhp, const char *pkg, bool force)
  
  /*
   * Returns 1 if there's an update, 0 if none or -1 on error.
@@ -1486,7 +1469,7 @@ index 7dd3ffd..1ab33d0 100644
  {
  	xbps_array_t rdeps;
  	xbps_dictionary_t pkgd;
-@@ -262,6 +326,8 @@ xbps_autoupdate(struct xbps_handle *xhp)
+@@ -262,6 +320,8 @@ xbps_autoupdate(struct xbps_handle *xhp)
  	if (!xbps_dictionary_get_cstring_nocopy(pkgd, "pkgname", &pkgname)) {
  		return EINVAL;
  	}
@@ -1495,7 +1478,7 @@ index 7dd3ffd..1ab33d0 100644
  
  	rv = trans_find_pkg(xhp, pkgname, false);
  
-@@ -310,16 +376,95 @@ xbps_autoupdate(struct xbps_handle *xhp)
+@@ -310,16 +370,95 @@ xbps_autoupdate(struct xbps_handle *xhp)
  	return 0;
  }
  
@@ -1592,7 +1575,7 @@ index 7dd3ffd..1ab33d0 100644
  	switch (rv) {
  	case 1:
  		/* xbps needs to be updated, don't allow any other update */
-@@ -331,11 +476,14 @@ xbps_transaction_update_packages(struct xbps_handle *xhp)
+@@ -331,11 +470,14 @@ xbps_transaction_update_packages(struct xbps_handle *xhp)
  		break;
  	}
  
@@ -1607,7 +1590,7 @@ index 7dd3ffd..1ab33d0 100644
  		char pkgname[XBPS_NAME_SIZE] = {0};
  
  		pkgd = xbps_dictionary_get_keysym(xhp->pkgdb, obj);
-@@ -346,8 +494,46 @@ xbps_transaction_update_packages(struct xbps_handle *xhp)
+@@ -346,8 +488,46 @@ xbps_transaction_update_packages(struct xbps_handle *xhp)
  			rv = EINVAL;
  			break;
  		}
@@ -1654,7 +1637,7 @@ index 7dd3ffd..1ab33d0 100644
  		if (rv == 0) {
  			newpkg_found = true;
  		} else if (rv == ENOENT || rv == EEXIST || rv == ENODEV) {
-@@ -359,6 +545,8 @@ xbps_transaction_update_packages(struct xbps_handle *xhp)
+@@ -359,6 +539,8 @@ xbps_transaction_update_packages(struct xbps_handle *xhp)
  		}
  	}
  	xbps_object_iterator_release(iter);
@@ -1663,7 +1646,7 @@ index 7dd3ffd..1ab33d0 100644
  
  	return newpkg_found ? rv : EEXIST;
  }
-@@ -367,14 +555,20 @@ int
+@@ -367,14 +549,20 @@ int
  xbps_transaction_update_pkg(struct xbps_handle *xhp, const char *pkg, bool force)
  {
  	xbps_array_t rdeps;
@@ -1687,7 +1670,7 @@ index 7dd3ffd..1ab33d0 100644
  			return EBUSY;
  		return 0;
  	case -1:
-@@ -415,13 +609,18 @@ int
+@@ -415,13 +603,18 @@ int
  xbps_transaction_install_pkg(struct xbps_handle *xhp, const char *pkg, bool force)
  {
  	xbps_array_t rdeps;
