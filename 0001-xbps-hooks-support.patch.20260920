@@ -24,32 +24,130 @@ index 3526445..201be21 100644
 +../xbps-remove/clean-cache.o: ../xbps-remove/clean-cache.c
 +	@printf " [CC]\t\t$@\n"
 +	${SILENT}$(CC) $(CPPFLAGS) $(PROG_CFLAGS) $(CFLAGS) $(EXTRA_CFLAGS) -c $< -o $@
-diff --git a/bin/xbps-install/defs.h b/bin/xbps-install/defs.h
-index 34680b2..e7933d2 100644
---- a/bin/xbps-install/defs.h
-+++ b/bin/xbps-install/defs.h
-@@ -49,7 +49,7 @@ struct transaction {
- /* from transaction.c */
- int	install_new_pkg(struct xbps_handle *, const char *, bool);
- int	update_pkg(struct xbps_handle *, const char *, bool);
--int	dist_upgrade(struct xbps_handle *, unsigned int, bool, bool);
-+int	dist_upgrade(struct xbps_handle *, unsigned int, bool, bool, int, char **);
- int	exec_transaction(struct xbps_handle *, unsigned int, bool, bool);
- 
- /* from question.c */
 diff --git a/bin/xbps-install/main.c b/bin/xbps-install/main.c
-index 8f8be81..fb1cc59 100644
+index 8f8be81..11aeb05 100644
 --- a/bin/xbps-install/main.c
 +++ b/bin/xbps-install/main.c
-@@ -263,7 +263,7 @@ main(int argc, char **argv)
+@@ -36,6 +36,7 @@
+ 
+ #include <xbps.h>
+ #include "defs.h"
++#include "../xbps-remove/defs.h"
+ 
+ static void __attribute__((noreturn))
+ usage(bool fail)
+@@ -57,6 +58,10 @@ usage(bool fail)
+ 	    " -M, --memory-sync           Remote repository data is fetched and stored\n"
+ 	    "                             in memory, ignoring on-disk repodata archives\n"
+ 	    " -n, --dry-run               Dry-run mode\n"
++	    " -O, --clean-cache           Remove outdated packages from the cache\n"
++	    "                             If specified twice, also remove uninstalled packages\n"
++	    "                             If specified three times, remove everything from the cache\n"
++	    " -o, --remove-orphans        Remove package orphans\n"
+ 	    " -R, --repository <url>      Add repository to the top of the list\n"
+ 	    "                             This option can be specified multiple times\n"
+ 	    " -r, --rootdir <dir>         Full path to rootdir\n"
+@@ -97,7 +102,7 @@ repo_import_key_cb(struct xbps_repo *repo, void *arg UNUSED, bool *done UNUSED)
+ int
+ main(int argc, char **argv)
+ {
+-	const char *shortopts = "AC:c:DdfhIiMnR:r:SuUVvy";
++	const char *shortopts = "AC:c:DdfhIiMnoOR:r:SuUVvy";
+ 	const struct option longopts[] = {
+ 		{ "automatic", no_argument, NULL, 'A' },
+ 		{ "config", required_argument, NULL, 'C' },
+@@ -110,6 +115,8 @@ main(int argc, char **argv)
+ 		{ "ignore-file-conflicts", no_argument, NULL, 'I' },
+ 		{ "memory-sync", no_argument, NULL, 'M' },
+ 		{ "dry-run", no_argument, NULL, 'n' },
++		{ "clean-cache", no_argument, NULL, 'O' },
++		{ "remove-orphans", no_argument, NULL, 'o' },
+ 		{ "repository", required_argument, NULL, 'R' },
+ 		{ "rootdir", required_argument, NULL, 'r' },
+ 		{ "sync", no_argument, NULL, 'S' },
+@@ -125,13 +132,13 @@ main(int argc, char **argv)
+ 	struct xbps_handle xh;
+ 	struct xferstat xfer;
+ 	const char *rootdir, *cachedir, *confdir;
+-	int i, c, flags, rv, fflag = 0;
+-	bool syncf, yes, force, drun, update;
++	int i, c, flags, rv, fflag = 0, clean_cache = 0;
++	bool syncf, yes, force, drun, update, orphans;
+ 	int maxcols, eexist = 0;
+ 
+ 	rootdir = cachedir = confdir = NULL;
+ 	flags = rv = 0;
+-	syncf = yes = force = drun = update = false;
++	syncf = yes = force = drun = update = orphans = false;
+ 
+ 	memset(&xh, 0, sizeof(xh));
+ 
+@@ -179,6 +186,12 @@ main(int argc, char **argv)
+ 		case 'n':
+ 			drun = true;
+ 			break;
++		case 'O':
++			clean_cache++;
++			break;
++		case 'o':
++			orphans = true;
++			break;
+ 		case 'R':
+ 			xbps_repo_store(&xh, optarg);
+ 			break;
+@@ -209,7 +222,7 @@ main(int argc, char **argv)
+ 			/* NOTREACHED */
+ 		}
+ 	}
+-	if ((!update && !syncf) && (argc == optind))
++	if ((!update && !syncf && !clean_cache && !orphans) && (argc == optind))
+ 		usage(true);
+ 
+ 	/*
+@@ -249,7 +262,7 @@ main(int argc, char **argv)
+ 		}
+ 	}
+ 
+-	if (syncf && !update && (argc == optind))
++	if (syncf && !update && !clean_cache && !orphans && (argc == optind))
+ 		exit(EXIT_SUCCESS);
+ 
+ 	if (!(xh.flags & XBPS_FLAG_DOWNLOAD_ONLY) && !drun) {
+@@ -259,6 +272,34 @@ main(int argc, char **argv)
+ 		}
+ 	}
+ 
++	if (clean_cache > 0) {
++		rv = clean_cachedir(&xh, clean_cache, drun);
++		if (rv != 0) {
++			xbps_end(&xh);
++			exit(EXIT_FAILURE);
++		}
++		if (!orphans && !update && (argc == optind))
++			exit(EXIT_SUCCESS);
++	}
++
++	if (orphans) {
++		if ((rv = xbps_transaction_autoremove_pkgs(&xh)) != 0 && rv != ENOENT) {
++			xbps_error_printf("Failed to queue package "
++			    "orphans: %s\n", strerror(rv));
++			xbps_end(&xh);
++			exit(EXIT_FAILURE);
++		}
++		if (rv == 0) {
++			rv = exec_transaction(&xh, maxcols, yes, drun);
++		} else {
++			rv = 0; /* ENOENT: no orphans found, nothing to do */
++		}
++		if (!update && (argc == optind)) {
++			xbps_end(&xh);
++			exit(rv);
++		}
++	}
++
+ 	eexist = optind;
  
  	if (update && (argc == optind)) {
- 		/* Update all installed packages */
--		rv = dist_upgrade(&xh, maxcols, yes, drun);
-+		rv = dist_upgrade(&xh, maxcols, yes, drun, argc, argv);
- 	} else if (update) {
- 		/* Update target packages */
- 		for (i = optind; i < argc; i++) {
 diff --git a/bin/xbps-install/state_cb.c b/bin/xbps-install/state_cb.c
 index 350c608..63fc574 100644
 --- a/bin/xbps-install/state_cb.c
@@ -75,149 +173,6 @@ index 350c608..63fc574 100644
  	case XBPS_STATE_UNPACK_FAIL:
  	case XBPS_STATE_UPDATE_FAIL:
  	case XBPS_STATE_CONFIGURE_FAIL:
-diff --git a/bin/xbps-install/transaction.c b/bin/xbps-install/transaction.c
-index e27d46e..792ba07 100644
---- a/bin/xbps-install/transaction.c
-+++ b/bin/xbps-install/transaction.c
-@@ -310,8 +310,124 @@ all_pkgs_on_hold(struct transaction *trans)
- 	return all_on_hold;
- }
- 
-+/*
-+ * Called when a full sysupgrade (-Su/-Syu, or -u with no target
-+ * package given) finds that xbps itself -- or whatever package
-+ * actually provides it, e.g. a distro's own replacement/fork -- needs
-+ * updating before anything else in the transaction can proceed.
-+ *
-+ * Updates just that one package, then re-execs this same
-+ * xbps-install invocation from scratch (same argv) so the freshly
-+ * updated binary/library picks up and continues with the rest of the
-+ * sysupgrade on its own. This automates the two-phase "update xbps
-+ * first, then re-run the same command" workflow a person otherwise
-+ * has to do by hand.
-+ *
-+ * Only one confirmation prompt covers the whole thing: if the person
-+ * didn't already pass -y, they're asked once, up front, and -y is
-+ * then added to the re-exec'd argv so the continuation after restart
-+ * never prompts a second time.
-+ */
-+static int
-+self_update_and_restart(struct xbps_handle *xhp, int argc, char **argv, bool yes)
-+{
-+	static char yflag[] = "-y";
-+	char selfpath[PATH_MAX];
-+	char **newargv;
-+	ssize_t n;
-+	int i, newargc, rv;
-+	bool need_y = true;
-+
-+	if (!yes) {
-+		if (!yesno("The package manager needs to update itself before "
-+		    "continuing; the rest of this upgrade will then resume "
-+		    "automatically, with no further prompts. Continue?")) {
-+			return 0;
-+		}
-+	}
-+
-+	printf("[*] Updating the package manager first...\n");
-+
-+	/*
-+	 * xbps_transaction_update_packages() above already left xhp->transd
-+	 * populated: xbps_autoupdate() -- called from inside it purely to
-+	 * *check* whether xbps needs updating -- calls trans_find_pkg()
-+	 * itself as a side effect of that check, queuing xbps into the
-+	 * transaction even though the caller went on to report EBUSY and
-+	 * never actually committed anything. Every transaction-building
-+	 * entry point (this one included) assumes it's the first and only
-+	 * one to touch xhp->transd in this process, starting from a clean
-+	 * slate. Building a second, unrelated transaction on top of that
-+	 * already-dirtied one silently produces an inconsistent result
-+	 * (previously verified in testing: the update reports success but
-+	 * never actually lands on disk, so the process loops forever
-+	 * re-detecting EBUSY after each restart). Release it and start
-+	 * over clean.
-+	 */
-+	if (xhp->transd != NULL) {
-+		xbps_object_release(xhp->transd);
-+		xhp->transd = NULL;
-+	}
-+
-+	rv = xbps_transaction_update_pkg(xhp, "xbps", false);
-+	if (rv != 0 && rv != EEXIST) {
-+		xbps_error_printf("Failed to queue the package manager update: %s\n",
-+		    strerror(rv));
-+		return rv;
-+	}
-+	if (rv == 0) {
-+		rv = exec_transaction(xhp, 80, true, false);
-+		if (rv != 0) {
-+			xbps_error_printf("Failed to update the package manager, aborting.\n");
-+			return rv;
-+		}
-+	}
-+
-+	/*
-+	 * Resolve our own executable's real, current path so the re-exec
-+	 * below is guaranteed to load the copy we just updated, rather
-+	 * than whatever a PATH lookup on argv[0] might turn up.
-+	 */
-+	n = readlink("/proc/self/exe", selfpath, sizeof(selfpath) - 1);
-+	if (n <= 0) {
-+		/* Not on Linux, or /proc unavailable: fall back to argv[0]. */
-+		xbps_strlcpy(selfpath, argv[0], sizeof(selfpath));
-+	} else {
-+		selfpath[n] = '\0';
-+	}
-+
-+	for (i = 0; i < argc; i++) {
-+		if (strcmp(argv[i], "-y") == 0 || strcmp(argv[i], "--yes") == 0) {
-+			need_y = false;
-+			break;
-+		}
-+	}
-+
-+	newargv = calloc((size_t)argc + 2, sizeof(char *));
-+	if (newargv == NULL) {
-+		xbps_error_printf("Out of memory; please re-run the command manually.\n");
-+		return ENOMEM;
-+	}
-+	for (i = 0; i < argc; i++)
-+		newargv[i] = argv[i];
-+	newargc = argc;
-+	if (need_y)
-+		newargv[newargc++] = yflag;
-+	newargv[newargc] = NULL;
-+
-+	printf("[*] Package manager updated, resuming the rest of the upgrade...\n");
-+	fflush(stdout);
-+
-+	execv(selfpath, newargv);
-+	/* execv() only returns on failure. */
-+	xbps_error_printf("Failed to restart %s: %s\n", selfpath, strerror(errno));
-+	free(newargv);
-+	return errno;
-+}
-+
- int
--dist_upgrade(struct xbps_handle *xhp, unsigned int cols, bool yes, bool drun)
-+dist_upgrade(struct xbps_handle *xhp, unsigned int cols, bool yes, bool drun,
-+    int argc, char **argv)
- {
- 	int rv = 0;
- 
-@@ -321,9 +437,10 @@ dist_upgrade(struct xbps_handle *xhp, unsigned int cols, bool yes, bool drun)
- 		return 0;
- 	} else if (rv == EBUSY) {
- 		if (!drun) {
--			xbps_error_printf("The 'xbps' package must be updated, please run `xbps-install -u xbps`\n");
--			return rv;
-+			return self_update_and_restart(xhp, argc, argv, yes);
- 		}
-+		/* dry-run: fall through to exec_transaction() below, same
-+		 * as upstream's existing behavior for this case. */
- 	} else if (rv == EEXIST) {
- 		return 0;
- 	} else if (rv == ENOTSUP) {
 diff --git a/bin/xbps-remove/clean-cache.c b/bin/xbps-remove/clean-cache.c
 index 38816b1..a06760a 100644
 --- a/bin/xbps-remove/clean-cache.c
