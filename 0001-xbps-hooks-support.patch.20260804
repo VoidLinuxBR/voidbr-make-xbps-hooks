@@ -1193,7 +1193,7 @@ index 0000000..818d3fc
 +	return rv;
 +}
 diff --git a/lib/transaction_ops.c b/lib/transaction_ops.c
-index 7dd3ffd..baf434d 100644
+index 7dd3ffd..f42f2cf 100644
 --- a/lib/transaction_ops.c
 +++ b/lib/transaction_ops.c
 @@ -239,9 +239,17 @@ trans_find_pkg(struct xbps_handle *xhp, const char *pkg, bool force)
@@ -1224,95 +1224,7 @@ index 7dd3ffd..baf434d 100644
  
  	rv = trans_find_pkg(xhp, pkgname, false);
  
-@@ -310,16 +320,95 @@ xbps_autoupdate(struct xbps_handle *xhp)
- 	return 0;
- }
- 
-+struct build_replaces_index_data {
-+	xbps_dictionary_t index;
-+};
-+
-+static int
-+build_replaces_index_cb(struct xbps_repo *repo, void *arg, bool *done UNUSED)
-+{
-+	struct build_replaces_index_data *d = arg;
-+	xbps_object_iterator_t iter;
-+	xbps_object_t obj;
-+
-+	if (repo->idx == NULL)
-+		return 0;
-+
-+	iter = xbps_dictionary_iterator(repo->idx);
-+	if (iter == NULL)
-+		return 0;
-+
-+	while ((obj = xbps_object_iterator_next(iter))) {
-+		xbps_dictionary_t pkgd = xbps_dictionary_get_keysym(repo->idx, obj);
-+		xbps_array_t replaces = xbps_dictionary_get(pkgd, "replaces");
-+		const char *newpkgname = xbps_dictionary_keysym_cstring_nocopy(obj);
-+		unsigned int j;
-+
-+		if (replaces == NULL || newpkgname == NULL)
-+			continue;
-+
-+		for (j = 0; j < xbps_array_count(replaces); j++) {
-+			const char *pattern = NULL;
-+			char patname[XBPS_NAME_SIZE] = {0};
-+
-+			if (!xbps_array_get_cstring_nocopy(replaces, j, &pattern))
-+				continue;
-+			if (!xbps_pkgpattern_name(patname, sizeof(patname), pattern) &&
-+			    !xbps_pkg_name(patname, sizeof(patname), pattern)) {
-+				xbps_strlcpy(patname, pattern, sizeof(patname));
-+			}
-+			/*
-+			 * First writer for a given old pkgname wins if two
-+			 * different packages both claim to replace it --
-+			 * an ambiguous setup, but not this code's job to
-+			 * arbitrate; just don't crash or overwrite silently
-+			 * back and forth across repos in an unstable order.
-+			 */
-+			if (!xbps_dictionary_get(d->index, patname))
-+				xbps_dictionary_set_cstring(d->index, patname, newpkgname);
-+		}
-+	}
-+	xbps_object_iterator_release(iter);
-+	return 0;
-+}
-+
-+/*
-+ * Scans every repo *once* and builds a dictionary mapping
-+ * "old pkgname that some package's replaces= array names" -> "the
-+ * pkgname of the package that replaces it". Used by
-+ * xbps_transaction_update_packages() below so that a plain sysupgrade
-+ * (-Syu) picks up a rename/replaces-based package swap automatically,
-+ * the same way an explicit `xbps-install <newpkg>` already does --
-+ * even when the old package is *still* published in the repo pool
-+ * (e.g. simply forgotten there rather than pruned), which is why this
-+ * doesn't gate on the old package being missing: building the index
-+ * once up front and doing an O(1) dictionary lookup per installed
-+ * package is cheap enough to always check, unlike the alternative of
-+ * rescanning the whole repo pool for every single installed package.
-+ */
-+static xbps_dictionary_t
-+build_replaces_index(struct xbps_handle *xhp)
-+{
-+	struct build_replaces_index_data d;
-+
-+	d.index = xbps_dictionary_create();
-+	if (d.index == NULL)
-+		return NULL;
-+	xbps_rpool_foreach(xhp, build_replaces_index_cb, &d);
-+	return d.index;
-+}
-+
- int
- xbps_transaction_update_packages(struct xbps_handle *xhp)
- {
- 	xbps_object_t obj;
- 	xbps_object_iterator_t iter;
- 	xbps_dictionary_t pkgd;
-+	xbps_dictionary_t replaces_idx;
+@@ -319,7 +329,7 @@ xbps_transaction_update_packages(struct xbps_handle *xhp)
  	bool newpkg_found = false;
  	int rv = 0;
  
@@ -1321,78 +1233,7 @@ index 7dd3ffd..baf434d 100644
  	switch (rv) {
  	case 1:
  		/* xbps needs to be updated, don't allow any other update */
-@@ -331,11 +420,14 @@ xbps_transaction_update_packages(struct xbps_handle *xhp)
- 		break;
- 	}
- 
-+	replaces_idx = build_replaces_index(xhp);
-+
- 	iter = xbps_dictionary_iterator(xhp->pkgdb);
- 	assert(iter);
- 
- 	while ((obj = xbps_object_iterator_next(iter))) {
- 		const char *pkgver = NULL;
-+		const char *newpkgname = NULL;
- 		char pkgname[XBPS_NAME_SIZE] = {0};
- 
- 		pkgd = xbps_dictionary_get_keysym(xhp->pkgdb, obj);
-@@ -346,8 +438,46 @@ xbps_transaction_update_packages(struct xbps_handle *xhp)
- 			rv = EINVAL;
- 			break;
- 		}
-+		/*
-+		 * Normal same-name lookup first, same as always.
-+		 */
- 		rv = trans_find_pkg(xhp, pkgname, false);
- 		xbps_dbg_printf("%s: trans_find_pkg %s: %d\n", __func__, pkgver, rv);
-+
-+		if ((rv == ENOENT || rv == EEXIST) &&
-+		    xbps_rpool_get_pkg(xhp, pkgname) == NULL &&
-+		    xbps_pkgdb_get_virtualpkg(xhp, pkgname) == NULL) {
-+			/*
-+			 * pkgname genuinely does not exist anywhere in the
-+			 * repo pool under its own name (checked directly,
-+			 * not just trusting trans_find_pkg's exact return
-+			 * code, which has been observed to come back as
-+			 * either ENOENT or EEXIST depending on what else is
-+			 * registered). Only in that case -- the package was
-+			 * truly dropped from the repo, not merely sitting
-+			 * alongside its replacement -- consult the
-+			 * pre-built replaces index (O(1)) to see if some
-+			 * other package now replaces it, and pull that one
-+			 * in instead, exactly as if the user had run
-+			 * `xbps-install newpkgname` explicitly.
-+			 *
-+			 * Deliberately NOT done when the old package is
-+			 * still present and valid in the repo pool: that
-+			 * would mean any repo's replaces= entry could
-+			 * silently swap out an otherwise perfectly normal,
-+			 * unrelated package (e.g. firefox -> firefox-esr)
-+			 * during a routine sysupgrade, with no signal that
-+			 * anything unusual is happening.
-+			 */
-+			if (replaces_idx != NULL &&
-+			    xbps_dictionary_get_cstring_nocopy(replaces_idx, pkgname, &newpkgname)) {
-+				xbps_dbg_printf("%s: %s replaced by %s\n",
-+				    __func__, pkgname, newpkgname);
-+				rv = trans_find_pkg(xhp, newpkgname, false);
-+				xbps_dbg_printf("%s: trans_find_pkg %s (replacement): %d\n",
-+				    __func__, newpkgname, rv);
-+			}
-+		}
- 		if (rv == 0) {
- 			newpkg_found = true;
- 		} else if (rv == ENOENT || rv == EEXIST || rv == ENODEV) {
-@@ -359,6 +489,8 @@ xbps_transaction_update_packages(struct xbps_handle *xhp)
- 		}
- 	}
- 	xbps_object_iterator_release(iter);
-+	if (replaces_idx != NULL)
-+		xbps_object_release(replaces_idx);
- 
- 	return newpkg_found ? rv : EEXIST;
- }
-@@ -367,14 +499,20 @@ int
+@@ -367,14 +377,20 @@ int
  xbps_transaction_update_pkg(struct xbps_handle *xhp, const char *pkg, bool force)
  {
  	xbps_array_t rdeps;
@@ -1416,7 +1257,7 @@ index 7dd3ffd..baf434d 100644
  			return EBUSY;
  		return 0;
  	case -1:
-@@ -415,13 +553,18 @@ int
+@@ -415,13 +431,18 @@ int
  xbps_transaction_install_pkg(struct xbps_handle *xhp, const char *pkg, bool force)
  {
  	xbps_array_t rdeps;
