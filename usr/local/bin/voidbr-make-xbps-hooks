@@ -8,20 +8,32 @@ git clone https://github.com/void-linux/xbps .
 git checkout -- .
 git clean -fd
 
-# Copie o arquivo 0001-xbps-hooks-support.patch pra dentro dessa pasta xbps/.
-cp ../0001-xbps-hooks-support.patch .
+# Patches aplicados em ordem (o 0002 depende do 0001)
+patches=(
+  0001-xbps-hooks-support.patch
+  0002-xbps-parallel-downloads.patch
+)
 
-# 2. Validar e aplicar o patch
-# Validar que aplica limpo (não muda nada ainda)
-if ! git apply --check 0001-xbps-hooks-support.patch; then
-  echo "ERRO, falha ao aplicar o patch" exit 1
-fi
-echo "OK, aplica limpo"
+# Copie os patches pra dentro dessa pasta xbps/.
+for p in "${patches[@]}"; do
+  cp "../$p" .
+done
 
-# Aplicar de verdade
-if ! git apply 0001-xbps-hooks-support.patch; then
-  echo "ERRO, falha ao aplicar o patch" exit 1
-fi
+# 2. Validar e aplicar os patches, um por vez e na ordem
+for p in "${patches[@]}"; do
+  # Validar que aplica limpo (não muda nada ainda)
+  if ! git apply --check "$p"; then
+    echo "ERRO, falha ao aplicar o patch $p"
+    exit 1
+  fi
+  echo "OK, $p aplica limpo"
+
+  # Aplicar de verdade
+  if ! git apply "$p"; then
+    echo "ERRO, falha ao aplicar o patch $p"
+    exit 1
+  fi
+done
 
 # 3. Instalar dependências de build
 sudo xbps-install -Sy libarchive-devel openssl-devel zlib-devel
